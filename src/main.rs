@@ -39,6 +39,20 @@ fn read_x11_selection() -> Result<String, String> {
         .map_err(|e| format!("invalid UTF-8: {}", e))
 }
 
+fn read_wayland_selection() -> Result<String, String> {
+    let output = Command::new("wl-paste")
+        .args(["--primary"])
+        .output()
+        .map_err(|e| format!("failed to run wl-paste: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("wl-paste exited with: {}", output.status));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("invalid UTF-8: {}", e))
+}
+
 fn main() {
     let server = detect_display_server();
     println!("Display server detected: {:?}", server);
@@ -48,9 +62,10 @@ fn main() {
             Ok(text) => println!("Selection: {}", text),
             Err(e) => eprintln!("Error: {}", e),
         },
-        DisplayServer::Wayland => {
-            eprintln!("Wayland reader not yet implemented.");
-        }
+        DisplayServer::Wayland => match read_wayland_selection() {
+            Ok(text) => println!("Selection: {}", text),
+            Err(e) => eprintln!("Error: {}", e),
+        },
         DisplayServer::Unknown => {
             eprintln!("Unknown display server — cannot read selection.");
         }
