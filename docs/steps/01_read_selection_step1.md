@@ -101,3 +101,37 @@ git add src/main.rs && git commit -m "feat: read X11 primary selection via xclip
 ```
 
 **Plain English:** Save the X11 clipboard-reading logic.
+
+---
+
+# Micro-Step 4 — Read Wayland Primary Selection via wl-paste
+
+## 1. Summary
+
+Added `read_wayland_selection()` function to `src/main.rs` that spawns `wl-paste --primary` and captures stdout. Updated the `Wayland` match arm in `main()` to call it.
+
+## 2. Purpose
+
+Completes the Wayland path — the system's actual display server. The program now reads primary selection on both X11 and Wayland.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **`wl-paste --primary`** | Reads the primary selection buffer on Wayland via the `wlr-data-control` protocol. |
+| **`wl-clipboard`** | Package providing `wl-copy` and `wl-paste` — standard Wayland clipboard CLI tools. |
+| **`map_err`** | Converts one error type to another — maps `io::Error` to a human-readable `String`. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Modify** | `src/main.rs` | 58 → 71 lines. Added `read_wayland_selection()`, updated `Wayland` match arm. |
+
+## 5. Git Guidance
+
+```bash
+git add src/main.rs && git commit -m "feat: read Wayland primary selection via wl-paste"
+```
+
+**Plain English:** Save the Wayland clipboard-reading logic.
