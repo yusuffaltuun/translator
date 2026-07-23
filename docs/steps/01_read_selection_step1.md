@@ -66,3 +66,38 @@ git add src/main.rs && git commit -m "feat: detect X11/Wayland display server"
 ```
 
 **Plain English:** Save the display-server detection logic.
+
+---
+
+# Micro-Step 3 — Read X11 Primary Selection via xclip
+
+## 1. Summary
+
+Added `read_x11_selection()` function to `src/main.rs` that spawns `xclip -selection primary -o` and captures its stdout. Updated `main()` to call it when X11 is detected.
+
+## 2. Purpose
+
+Provides the X11 path for reading the primary selection. One of two display-server branches; Wayland follows next.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **`Command::new("xclip")`** | Rust's `std::process::Command` — spawns a child process. |
+| **`.args([...])`** | Passes CLI arguments to the spawned process. |
+| **`.output()`** | Runs the process to completion and captures stdout/stderr. |
+| **`Result<String, String>`** | Rust's `Result` type — `Ok(String)` on success, `Err(String)` on failure. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Modify** | `src/main.rs` | 29 → 51 lines. Added `use std::process::Command`, `read_x11_selection()`, updated `main()` with match arms. |
+
+## 5. Git Guidance
+
+```bash
+git add src/main.rs && git commit -m "feat: read X11 primary selection via xclip"
+```
+
+**Plain English:** Save the X11 clipboard-reading logic.
