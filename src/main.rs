@@ -23,7 +23,36 @@ fn detect_display_server() -> DisplayServer {
     }
 }
 
+use std::process::Command;
+
+fn read_x11_selection() -> Result<String, String> {
+    let output = Command::new("xclip")
+        .args(["-selection", "primary", "-o"])
+        .output()
+        .map_err(|e| format!("failed to run xclip: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("xclip exited with: {}", output.status));
+    }
+
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("invalid UTF-8: {}", e))
+}
+
 fn main() {
     let server = detect_display_server();
     println!("Display server detected: {:?}", server);
+
+    match server {
+        DisplayServer::X11 => match read_x11_selection() {
+            Ok(text) => println!("Selection: {}", text),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+        DisplayServer::Wayland => {
+            eprintln!("Wayland reader not yet implemented.");
+        }
+        DisplayServer::Unknown => {
+            eprintln!("Unknown display server — cannot read selection.");
+        }
+    }
 }
