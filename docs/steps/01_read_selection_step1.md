@@ -30,3 +30,39 @@ git commit -m "chore: initialize rust project scaffold"
 ```
 
 **Plain English:** Stage and commit the two new files as a clean save-point.
+
+---
+
+# Micro-Step 2 — Detect Display Server (X11 / Wayland)
+
+## 1. Summary
+
+Added display-server detection to `src/main.rs`. The program reads `XDG_SESSION_TYPE`, `WAYLAND_DISPLAY`, and `DISPLAY` environment variables to determine if the session is Wayland, X11, or Unknown.
+
+## 2. Purpose
+
+Selection capture uses different protocols depending on the display server. Knowing which one is active routes to the correct reader in later micro-steps.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **`XDG_SESSION_TYPE`** | Env var set by Linux display managers — `"x11"` or `"wayland"`. |
+| **`WAYLAND_DISPLAY`** | Env var set when a Wayland compositor is running. |
+| **`DISPLAY`** | Env var set when an X11 server is running. |
+| **`enum`** | Rust type that can be one of several variants. |
+| **`match`** | Rust pattern-matching control flow. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Modify** | `src/main.rs` | 3 → 33 lines. Added `use std::env`, `enum DisplayServer`, `detect_display_server()`, updated `main()`. |
+
+## 5. Git Guidance
+
+```bash
+git add src/main.rs && git commit -m "feat: detect X11/Wayland display server"
+```
+
+**Plain English:** Save the display-server detection logic.
