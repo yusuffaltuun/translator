@@ -2,6 +2,8 @@ use std::env;
 
 mod translator;
 
+use translator::Translator;
+
 #[derive(Debug, PartialEq)]
 enum DisplayServer {
     Wayland,
@@ -71,5 +73,11 @@ fn main() {
         DisplayServer::Unknown => {
             eprintln!("Unknown display server — cannot read selection.");
         }
+    }
+
+    let model_path = "models/model-fp32.onnx";
+    match Translator::load_model(model_path) {
+        Ok(_t) => println!("Model loaded successfully from: {}", model_path),
+        Err(e) => eprintln!("Failed to load model: {}", e),
     }
 }

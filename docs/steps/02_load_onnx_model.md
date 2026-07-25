@@ -32,3 +32,41 @@ git add Cargo.toml src/translator.rs src/main.rs && git commit -m "chore: add or
 ```
 
 **Plain English:** Save the ONNX Runtime dependency and empty translator module.
+
+---
+
+# Micro-Step 2 — Download ONNX Model & Verify Loading
+
+## 1. Summary
+
+Downloaded `model-fp32.onnx` (170MB) and `tokenizer.json` (2MB) from `Teradata/opus-mt_tiny_eng-tur` into `models/`. Updated `main.rs` to load the model on startup and print success. Created `.gitignore` to exclude model files from git.
+
+## 2. Purpose
+
+Provides the actual translation model for `ort` to load. Validates that the full ONNX Runtime pipeline works end-to-end.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **MarianMT** | Lightweight seq2seq translation model by Microsoft/Helsinki-NLP. |
+| **`model-fp32.onnx`** | Full-precision (32-bit float) ONNX model file — encoder + decoder merged. |
+| **`tokenizer.json`** | SentencePiece tokenizer converting text ↔ token IDs. |
+| **`.gitignore`** | Tells git to exclude files matching patterns — model binaries are too large for version control. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Add** | `models/model-fp32.onnx` | 170MB binary — MarianMT en→tr model |
+| **Add** | `models/tokenizer.json` | 2MB — SentencePiece tokenizer |
+| **Modify** | `src/main.rs` | 75 → 85 lines. Added `use translator::Translator`, model loading call in `main()` |
+| **Add** | `.gitignore` | 2 lines — excludes `models/*.onnx` and `models/*.json` |
+
+## 5. Git Guidance
+
+```bash
+git add src/main.rs src/translator.rs .gitignore docs/steps/02_load_onnx_model.md && git commit -m "feat: download onnx model and verify loading"
+```
+
+**Plain English:** Save the model loading code, .gitignore, and docs. Model files themselves are excluded from git.
