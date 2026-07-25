@@ -1,5 +1,7 @@
 use std::env;
 
+mod translator;
+
 #[derive(Debug, PartialEq)]
 enum DisplayServer {
     Wayland,
