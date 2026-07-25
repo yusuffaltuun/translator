@@ -24,7 +24,7 @@ Upon completing each milestone, the Agent must document the step using the 5-poi
 ## 4. Active Roadmap & Progress
 - [x] **Step 0:** Project directory initialized; `AGENT.md` and `docs/steps/` structure established.
 - [x] **Step 1:** Read Linux Primary Selection text (Wayland/X11) via native Rust and output to stdout.
-- [ ] **Step 2:** Load a local ONNX model in Rust (`ort` crate) and perform local inference/translation.
+- [x] **Step 2:** Load a local ONNX model in Rust (`ort` crate) and perform local inference/translation.
 - [ ] **Step 3:** Setup a non-intrusive, floating overlay UI using Tauri v2.
 - [ ] **Step 4:** Integrate global keybindings to trigger selection capture and UI displays seamlessly.
 EOF

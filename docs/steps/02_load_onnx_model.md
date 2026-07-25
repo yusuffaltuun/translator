@@ -70,3 +70,41 @@ git add src/main.rs src/translator.rs .gitignore docs/steps/02_load_onnx_model.m
 ```
 
 **Plain English:** Save the model loading code, .gitignore, and docs. Model files themselves are excluded from git.
+
+---
+
+# Micro-Step 3 — Implement Translation Inference Pipeline
+
+## 1. Summary
+
+Implemented the full translation inference pipeline. Added `tokenizers = "0.21"` to `Cargo.toml`. Rewrote `src/translator.rs` with `translate()` that tokenizes input, passes all 7 BeamSearch inputs to the ONNX model, and decodes the output tokens. Verified: `"Hello, how are you?"` → `"Merhaba, nasılsınız?"`.
+
+## 2. Purpose
+
+This is the core functionality of Step 2 — the program now translates English text to Turkish entirely offline.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **BeamSearch** | Decoding algorithm exploring multiple hypotheses in parallel. Built into this model's ONNX graph. |
+| **`num_beams: 1`** | Greedy mode — one hypothesis, fastest. |
+| **`repetition_penalty: 3.0`** | Prevents token repetition loops. |
+| **`tokenizers` crate** | Hugging Face's Rust library for loading `tokenizer.json`. |
+| **`Tensor::from_array`** | Creates an ONNX input tensor from a Rust `(shape, data)` tuple. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Modify** | `Cargo.toml` | Added `tokenizers = "0.21"` |
+| **Rewrite** | `src/translator.rs` | 21 → 82 lines. Full BeamSearch inference pipeline. |
+| **Modify** | `src/main.rs` | 83 → 81 lines. Added `tokenizer_path`, `translate()` call. |
+
+## 5. Git Guidance
+
+```bash
+git add Cargo.toml src/translator.rs src/main.rs && git commit -m "feat: implement offline translation inference pipeline"
+```
+
+**Plain English:** Save the working translation logic.
