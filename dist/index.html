@@ -193,41 +193,53 @@
     const btnClose = document.getElementById('btn-close');
 
     let invoke = null;
+    let listen = null;
     let appWindow = null;
 
-    function resolveInvoke() {
+    function resolveTauri() {
       const t = window.__TAURI__;
       if (!t) return false;
-      // Tauri v2: core.invoke
-      if (t.core && typeof t.core.invoke === 'function') {
-        invoke = t.core.invoke;
-      // Tauri v2 fallback: primitives.invoke
-      } else if (t.primitives && typeof t.primitives.invoke === 'function') {
-        invoke = t.primitives.invoke;
-      // Tauri v2 fallback: direct invoke on root
-      } else if (typeof t.invoke === 'function') {
-        invoke = t.invoke;
+
+      // resolve invoke
+      if (t.core && typeof t.core.invoke === 'function') invoke = t.core.invoke;
+      else if (t.primitives && typeof t.primitives.invoke === 'function') invoke = t.primitives.invoke;
+      else if (typeof t.invoke === 'function') invoke = t.invoke;
+
+      // resolve listen
+      if (t.event && typeof t.event.listen === 'function') listen = t.event.listen;
+
+      // resolve appWindow
+      if (t.window) {
+        const ctor = t.window.getCurrentWindow || t.window.appWindow;
+        if (ctor) appWindow = typeof ctor === 'function' ? ctor() : ctor;
       }
-      if (invoke && t.window) {
-        const getCurrentWindow = t.window.getCurrentWindow || t.window.appWindow;
-        if (getCurrentWindow) appWindow = getCurrentWindow();
-      }
-      // Last resort: appWindow fallback
-      if (!appWindow && t.window && t.window.appWindow) {
-        appWindow = t.window.appWindow;
-      }
+
       return invoke !== null && appWindow !== null;
     }
 
     function waitForTauri(maxWait) {
       return new Promise((resolve) => {
-        if (resolveInvoke()) return resolve(true);
+        if (resolveTauri()) return resolve(true);
         const start = Date.now();
         const interval = setInterval(() => {
-          if (resolveInvoke()) { clearInterval(interval); resolve(true); }
+          if (resolveTauri()) { clearInterval(interval); resolve(true); }
           else if (Date.now() - start > maxWait) { clearInterval(interval); resolve(false); }
         }, 50);
       });
+    }
+
+    function updateUI(payload) {
+      if (payload.error) {
+        sourceEl.textContent = payload.source || '—';
+        targetEl.textContent = '—';
+        statusEl.textContent = payload.error;
+        statusEl.className = 'status error';
+      } else {
+        sourceEl.textContent = payload.source;
+        targetEl.textContent = payload.translation;
+        statusEl.textContent = '';
+        statusEl.className = 'status';
+      }
     }
 
     (async () => {
@@ -241,6 +253,13 @@
 
       appWindow.show();
       appWindow.setFocus();
+
+      // Listen for translate-result events emitted by the global shortcut handler
+      if (listen) {
+        listen('translate-result', (event) => {
+          updateUI(event.payload);
+        });
+      }
 
       btnClose.addEventListener('click', () => appWindow.hide());
 

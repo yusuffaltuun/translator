@@ -28,8 +28,20 @@ impl Translator {
             .encode(text, true)
             .map_err(|e| format!("tokenization error: {}", e))?;
 
-        let input_ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
-        let attention_mask: Vec<i32> = encoding.get_attention_mask().iter().map(|&m| m as i32).collect();
+        let mut input_ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+        let mut attention_mask: Vec<i32> = encoding.get_attention_mask().iter().map(|&m| m as i32).collect();
+
+        const MAX_SOURCE_LEN: usize = 512;
+        if input_ids.len() > MAX_SOURCE_LEN {
+            log::warn!(
+                "Truncating input from {} tokens to {}",
+                input_ids.len(),
+                MAX_SOURCE_LEN
+            );
+            input_ids.truncate(MAX_SOURCE_LEN);
+            attention_mask.truncate(MAX_SOURCE_LEN);
+        }
+
         let seq_len = input_ids.len();
 
         let input_ids_tensor = Tensor::from_array(([1, seq_len], input_ids))

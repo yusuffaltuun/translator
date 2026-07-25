@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex};
 
 use axum::{Router, extract::State as AxumState, routing::get};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -9,35 +9,31 @@ struct TranslatorState(Arc<Mutex<translator::translator::Translator>>);
 
 struct AppState {
     translator: Arc<Mutex<translator::translator::Translator>>,
-    visible: AtomicBool,
     app: AppHandle,
 }
 
 #[tauri::command]
-fn read_selection() -> Result<String, String> {
-    translator::read_selection()
+async fn read_selection() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| translator::read_selection())
+        .await
+        .map_err(|e| format!("task join error: {}", e))?
 }
 
 #[tauri::command]
-fn translate(text: String, state: State<'_, TranslatorState>) -> Result<String, String> {
-    let mut translator = state.0.lock().map_err(|e| e.to_string())?;
-    translator.translate(&text)
+async fn translate(text: String, state: State<'_, TranslatorState>) -> Result<String, String> {
+    let translator = state.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut t = translator.lock().map_err(|e| e.to_string())?;
+        t.translate(&text)
+    })
+    .await
+    .map_err(|e| format!("task join error: {}", e))?
 }
 
 async fn selection_translate(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
-    let was_visible = state.visible.fetch_xor(true, Ordering::SeqCst);
-
     let window: Option<WebviewWindow> = state.app.get_webview_window("main");
-
-    if was_visible {
-        if let Some(w) = &window {
-            let _ = w.hide();
-        }
-        log::info!("overlay hidden via HTTP");
-        return axum::Json(serde_json::json!({ "action": "hidden" }));
-    }
 
     if let Some(w) = &window {
         let _ = w.show();
@@ -45,49 +41,37 @@ async fn selection_translate(
     }
     log::info!("overlay shown via HTTP, reading selection…");
 
-    match translator::read_selection() {
-        Ok(text) if text.trim().is_empty() => {
-            let _ = state.app.emit("translate-result", serde_json::json!({
-                "source": "",
-                "error": "No primary selection found. Select some text first."
-            }));
-            axum::Json(serde_json::json!({
-                "source": "",
-                "error": "No primary selection found. Select some text first."
-            }))
-        }
-        Ok(text) => {
-            let translation = state
-                .translator
-                .lock()
-                .map_err(|e| e.to_string())
-                .and_then(|mut t| t.translate(&text));
+    let translator = state.translator.clone();
+    let app = state.app.clone();
 
-            let payload = match translation {
-                Ok(tr) => serde_json::json!({
-                    "source": text,
-                    "translation": tr
-                }),
-                Err(e) => serde_json::json!({
-                    "source": text,
-                    "error": e
-                }),
-            };
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
+        let text = translator::read_selection()?;
+        if text.trim().is_empty() {
+            return Err("No primary selection found. Select some text first.".into());
+        }
+        let mut t = translator.lock().map_err(|e| e.to_string())?;
+        let tr = t.translate(&text)?;
+        Ok((text, tr))
+    })
+    .await;
 
-            let _ = state.app.emit("translate-result", &payload);
-            axum::Json(payload)
-        }
-        Err(e) => {
-            let _ = state.app.emit("translate-result", serde_json::json!({
-                "source": "",
-                "error": e
-            }));
-            axum::Json(serde_json::json!({
-                "source": "",
-                "error": e
-            }))
-        }
-    }
+    let payload = match result {
+        Ok(Ok((source, translation))) => serde_json::json!({
+            "source": source,
+            "translation": translation
+        }),
+        Ok(Err(e)) => serde_json::json!({
+            "source": "",
+            "error": e
+        }),
+        Err(e) => serde_json::json!({
+            "source": "",
+            "error": format!("task failed: {}", e)
+        }),
+    };
+
+    let _ = app.emit("translate-result", &payload);
+    axum::Json(payload)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -147,7 +131,6 @@ pub fn run() {
             // ── Start HTTP trigger server ──
             let app_state = Arc::new(AppState {
                 translator: shared_translator,
-                visible: AtomicBool::new(false),
                 app: app.handle().clone(),
             });
 

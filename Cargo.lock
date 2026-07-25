@@ -1140,6 +1140,7 @@ dependencies = [
 name = "translator"
 version = "0.1.0"
 dependencies = [
+ "log",
  "ort",
  "tokenizers",
 ]
