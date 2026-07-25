@@ -1,2 +1,5 @@
 models/*.onnx
 models/*.json
+target/
+src-tauri/target/
+src-tauri/models

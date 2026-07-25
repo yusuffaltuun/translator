@@ -42,16 +42,32 @@ pub fn read_x11_selection() -> Result<String, String> {
 }
 
 pub fn read_wayland_selection() -> Result<String, String> {
+    // Try --primary first, fall back to -p (some compositors differ)
     let output = Command::new("wl-paste")
         .args(["--primary"])
         .output()
-        .map_err(|e| format!("failed to run wl-paste: {}", e))?;
+        .or_else(|_| Command::new("wl-paste").args(["-p"]).output())
+        .map_err(|e| format!("wl-paste not found (install wl-clipboard): {}", e))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if !output.status.success() {
-        return Err(format!("wl-paste exited with: {}", output.status));
+        let code = output.status.code().unwrap_or(-1);
+        if code == 1 && (stderr.contains("no selection") || stderr.contains("empty")) {
+            return Err("No primary selection found. Select some text first.".into());
+        }
+        return Err(format!("wl-paste exited {}: {}", code, stderr.trim()));
     }
 
-    String::from_utf8(output.stdout).map_err(|e| format!("invalid UTF-8: {}", e))
+    let text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("invalid UTF-8 in clipboard: {}", e))?;
+
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Primary selection is empty. Select some text first.".into());
+    }
+
+    Ok(trimmed)
 }
 
 pub fn read_selection() -> Result<String, String> {
