@@ -80,12 +80,27 @@
       margin-bottom: 6px;
     }
     .source-text {
+      width: 100%;
+      min-height: 38px;
+      max-height: 60px;
+      padding: 0;
+      border: none;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      font-family: inherit;
       font-size: 13px;
       color: rgba(255, 255, 255, 0.75);
       line-height: 1.5;
-      max-height: 60px;
+      resize: none;
+      outline: none;
       overflow-y: auto;
       word-wrap: break-word;
+    }
+    .source-text::placeholder {
+      color: rgba(255, 255, 255, 0.25);
+    }
+    .source-text:focus {
+      background: rgba(255, 255, 255, 0.08);
     }
 
     /* ── Divider ── */
@@ -168,7 +183,7 @@
 
     <div class="source">
       <div class="source-label">Source</div>
-      <div class="source-text" id="source-text">Select text anywhere, then click Translate.</div>
+      <textarea class="source-text" id="source-text" placeholder="Select text or type here…"></textarea>
     </div>
 
     <div class="divider"></div>
@@ -200,15 +215,12 @@
       const t = window.__TAURI__;
       if (!t) return false;
 
-      // resolve invoke
       if (t.core && typeof t.core.invoke === 'function') invoke = t.core.invoke;
       else if (t.primitives && typeof t.primitives.invoke === 'function') invoke = t.primitives.invoke;
       else if (typeof t.invoke === 'function') invoke = t.invoke;
 
-      // resolve listen
       if (t.event && typeof t.event.listen === 'function') listen = t.event.listen;
 
-      // resolve appWindow
       if (t.window) {
         const ctor = t.window.getCurrentWindow || t.window.appWindow;
         if (ctor) appWindow = typeof ctor === 'function' ? ctor() : ctor;
@@ -228,14 +240,48 @@
       });
     }
 
+    let debounceTimer = null;
+    let isTranslating = false;
+
+    async function translateText(text) {
+      if (!text || !text.trim()) {
+        targetEl.textContent = '—';
+        statusEl.textContent = '';
+        statusEl.className = 'status';
+        return;
+      }
+      if (isTranslating) return;
+      isTranslating = true;
+      targetEl.textContent = '—';
+      statusEl.textContent = 'Translating…';
+      statusEl.className = 'status translating';
+      try {
+        const translation = await invoke('translate', { text });
+        targetEl.textContent = translation;
+        statusEl.textContent = '';
+        statusEl.className = 'status';
+      } catch (err) {
+        targetEl.textContent = '—';
+        statusEl.textContent = String(err);
+        statusEl.className = 'status error';
+      } finally {
+        isTranslating = false;
+      }
+    }
+
+    function scheduleTranslate(text) {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => translateText(text), 300);
+    }
+
     function updateUI(payload) {
       if (payload.error) {
-        sourceEl.textContent = payload.source || '—';
+        sourceEl.value = payload.source || '';
         targetEl.textContent = '—';
         statusEl.textContent = payload.error;
         statusEl.className = 'status error';
       } else {
-        sourceEl.textContent = payload.source;
+        sourceEl.value = payload.source;
         targetEl.textContent = payload.translation;
         statusEl.textContent = '';
         statusEl.className = 'status';
@@ -251,10 +297,6 @@
         return;
       }
 
-      appWindow.show();
-      appWindow.setFocus();
-
-      // Listen for translate-result events emitted by the global shortcut handler
       if (listen) {
         listen('translate-result', (event) => {
           updateUI(event.payload);
@@ -278,7 +320,7 @@
             return;
           }
 
-          sourceEl.textContent = text;
+          sourceEl.value = text;
           statusEl.textContent = 'Translating…';
           statusEl.className = 'status translating';
 
@@ -293,6 +335,10 @@
         } finally {
           btnTranslate.disabled = false;
         }
+      });
+
+      sourceEl.addEventListener('input', () => {
+        scheduleTranslate(sourceEl.value);
       });
 
       document.getElementById('drag-region').addEventListener('mousedown', async (e) => {
