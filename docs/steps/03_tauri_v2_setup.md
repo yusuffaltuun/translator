@@ -85,3 +85,43 @@ git add src/lib.rs src/main.rs Cargo.toml src-tauri/Cargo.toml src-tauri/src/lib
 ```
 
 **Plain English:** Save the library conversion, Tauri commands, and capability permissions.
+
+---
+
+# Micro-Step 3 — Floating Overlay UI Frontend
+
+## 1. Summary
+
+Updated `src-tauri/tauri.conf.json` to configure a frameless, transparent, always-on-top window (380x220, hidden on start). Rewrote `dist/index.html` with a functional overlay UI: dark theme card with drag handle, source/translation text areas, "Translate Selection" button, and close button. Frontend calls `invoke('read_selection')` and `invoke('translate', { text })` via Tauri v2's injected IPC bridge.
+
+## 2. Purpose
+
+This is the visual layer of the floating overlay. The user selects text anywhere on screen, then clicks "Translate Selection" — the frontend calls the Rust backend, receives the translation, and displays it in a non-intrusive floating card. The window starts hidden (`visible: false`) and is shown via `appWindow.show()` after DOM loads — Step 4 will tie this to a global hotkey.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **Frameless window** | `"decorations": false` — removes title bar and OS window chrome. The app draws its own header. |
+| **Transparent window** | `"transparent": true` — the webview background is alpha-transparent. Only the drawn content is visible. |
+| **Always-on-top** | `"alwaysOnTop": true` — window stays above all other windows. |
+| **`skipTaskbar`** | Hides the window from the taskbar/dock — appropriate for overlay/utility windows. |
+| **`visible: false`** | Window created hidden. Shown programmatically via `appWindow.show()`. |
+| **`window.__TAURI__`** | Tauri v2's injected IPC bridge. Provides `core.invoke()` for calling Rust commands and `window` module for window control. |
+| **`startDragging()`** | Tauri API — begins window drag from the next mouse event. Used for custom title bar drag regions. |
+| **`getCurrentWindow()`** | Returns the `WebviewWindow` handle for the current webview, enabling `.show()`, `.hide()`, `.startDragging()`. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Modify** | `src-tauri/tauri.conf.json` | 37 → 40 lines — transparent, frameless, always-on-top, skipTaskbar, visible:false, identifier update |
+| **Rewrite** | `dist/index.html` | 26 → 148 lines — full overlay UI with drag, translate, close, status feedback |
+
+## 5. Git Guidance
+
+```bash
+git add src-tauri/tauri.conf.json dist/index.html docs/steps/03_tauri_v2_setup.md && git commit -m "feat: implement floating overlay ui frontend"
+```
+
+**Plain English:** Save the overlay window config and the interactive HTML frontend.

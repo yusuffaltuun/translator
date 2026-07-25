@@ -5,22 +5,282 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Translator</title>
   <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
     body {
-      margin: 0;
       background: transparent;
-      font-family: sans-serif;
-      display: flex;
-      justify-content: center;
-      align-items: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      overflow: hidden;
       height: 100vh;
+      user-select: none;
     }
-    #placeholder {
-      color: #888;
+
+    .overlay {
+      background: rgba(30, 30, 30, 0.92);
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header (drag handle) ── */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      cursor: grab;
+      background: rgba(255, 255, 255, 0.04);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    .header:active { cursor: grabbing; }
+
+    .header-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.5);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .btn-icon {
+      width: 22px;
+      height: 22px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    .btn-close {
+      background: rgba(255, 255, 255, 0.06);
+      color: rgba(255, 255, 255, 0.4);
+    }
+    .btn-close:hover {
+      background: #e74c3c;
+      color: #fff;
+    }
+
+    /* ── Source text ── */
+    .source {
+      padding: 12px 14px 8px;
+      flex-shrink: 0;
+    }
+    .source-label {
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.3);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .source-text {
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.75);
+      line-height: 1.5;
+      max-height: 60px;
+      overflow-y: auto;
+      word-wrap: break-word;
+    }
+
+    /* ── Divider ── */
+    .divider {
+      height: 1px;
+      background: rgba(255, 255, 255, 0.06);
+      margin: 0 14px;
+    }
+
+    /* ── Translation result ── */
+    .target {
+      padding: 10px 14px;
+      flex: 1;
+      overflow-y: auto;
+      min-height: 0;
+    }
+    .target-label {
+      font-size: 10px;
+      color: rgba(34, 197, 94, 0.6);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .target-text {
       font-size: 14px;
+      font-weight: 500;
+      color: #22c55e;
+      line-height: 1.5;
+      word-wrap: break-word;
     }
+
+    /* ── Footer ── */
+    .footer {
+      padding: 8px 14px;
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    .btn {
+      flex: 1;
+      padding: 7px 0;
+      border: none;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: #22c55e;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #16a34a; }
+    .btn-primary:disabled {
+      background: rgba(34, 197, 94, 0.2);
+      color: rgba(34, 197, 94, 0.4);
+      cursor: not-allowed;
+    }
+
+    /* ── States ── */
+    .status {
+      padding: 4px 14px 6px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.3);
+      flex-shrink: 0;
+    }
+    .status.error { color: #e74c3c; }
+    .status.translating { color: #f59e0b; }
+
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
-  <div id="placeholder">Translator overlay — ready for Step 4</div>
+  <div class="overlay">
+    <div class="header" id="drag-region">
+      <span class="header-title">Translator</span>
+      <button class="btn-icon btn-close" id="btn-close" title="Close">✕</button>
+    </div>
+
+    <div class="source">
+      <div class="source-label">Source</div>
+      <div class="source-text" id="source-text">Select text anywhere, then click Translate.</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="target">
+      <div class="target-label">Translation</div>
+      <div class="target-text" id="target-text">—</div>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <div class="footer">
+      <button class="btn btn-primary" id="btn-translate">Translate Selection</button>
+    </div>
+  </div>
+
+  <script>
+    const sourceEl = document.getElementById('source-text');
+    const targetEl = document.getElementById('target-text');
+    const statusEl = document.getElementById('status');
+    const btnTranslate = document.getElementById('btn-translate');
+    const btnClose = document.getElementById('btn-close');
+
+    let invoke = null;
+    let appWindow = null;
+
+    function resolveInvoke() {
+      const t = window.__TAURI__;
+      if (!t) return false;
+      // Tauri v2: core.invoke
+      if (t.core && typeof t.core.invoke === 'function') {
+        invoke = t.core.invoke;
+      // Tauri v2 fallback: primitives.invoke
+      } else if (t.primitives && typeof t.primitives.invoke === 'function') {
+        invoke = t.primitives.invoke;
+      // Tauri v2 fallback: direct invoke on root
+      } else if (typeof t.invoke === 'function') {
+        invoke = t.invoke;
+      }
+      if (invoke && t.window) {
+        const getCurrentWindow = t.window.getCurrentWindow || t.window.appWindow;
+        if (getCurrentWindow) appWindow = getCurrentWindow();
+      }
+      // Last resort: appWindow fallback
+      if (!appWindow && t.window && t.window.appWindow) {
+        appWindow = t.window.appWindow;
+      }
+      return invoke !== null && appWindow !== null;
+    }
+
+    function waitForTauri(maxWait) {
+      return new Promise((resolve) => {
+        if (resolveInvoke()) return resolve(true);
+        const start = Date.now();
+        const interval = setInterval(() => {
+          if (resolveInvoke()) { clearInterval(interval); resolve(true); }
+          else if (Date.now() - start > maxWait) { clearInterval(interval); resolve(false); }
+        }, 50);
+      });
+    }
+
+    (async () => {
+      const ready = await waitForTauri(5000);
+      if (!ready) {
+        statusEl.textContent = 'IPC not available. Run via `npx tauri dev`.';
+        statusEl.className = 'status error';
+        btnTranslate.disabled = true;
+        return;
+      }
+
+      appWindow.show();
+      appWindow.setFocus();
+
+      btnClose.addEventListener('click', () => appWindow.hide());
+
+      btnTranslate.addEventListener('click', async () => {
+        btnTranslate.disabled = true;
+        targetEl.textContent = '—';
+        statusEl.textContent = 'Reading selection…';
+        statusEl.className = 'status';
+
+        try {
+          const text = await invoke('read_selection');
+          if (!text || !text.trim()) {
+            statusEl.textContent = 'No text selected.';
+            statusEl.className = 'status error';
+            btnTranslate.disabled = false;
+            return;
+          }
+
+          sourceEl.textContent = text;
+          statusEl.textContent = 'Translating…';
+          statusEl.className = 'status translating';
+
+          const translation = await invoke('translate', { text });
+          targetEl.textContent = translation;
+          statusEl.textContent = '';
+          statusEl.className = 'status';
+        } catch (err) {
+          targetEl.textContent = '—';
+          statusEl.textContent = String(err);
+          statusEl.className = 'status error';
+        } finally {
+          btnTranslate.disabled = false;
+        }
+      });
+
+      document.getElementById('drag-region').addEventListener('mousedown', async (e) => {
+        if (e.target.closest('.btn-icon')) return;
+        await appWindow.startDragging();
+      });
+    })();
+  </script>
 </body>
 </html>

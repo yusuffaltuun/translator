@@ -2,18 +2,23 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "translator",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.translator.overlay",
   "build": {
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Translator",
-        "width": 800,
-        "height": 600,
+        "width": 380,
+        "height": 220,
         "resizable": true,
-        "fullscreen": false
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": true
       }
     ],
     "security": {
