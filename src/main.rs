@@ -76,8 +76,19 @@ fn main() {
     }
 
     let model_path = "models/model-fp32.onnx";
-    match Translator::load_model(model_path) {
-        Ok(_t) => println!("Model loaded successfully from: {}", model_path),
+    let tokenizer_path = "models/tokenizer.json";
+
+    match Translator::load_model(model_path, tokenizer_path) {
+        Ok(mut translator) => {
+            println!("Model loaded successfully from: {}", model_path);
+
+            let sample = "Hello, how are you?";
+            println!("Translating: \"{}\"", sample);
+            match translator.translate(sample) {
+                Ok(translation) => println!("Translation: \"{}\"", translation),
+                Err(e) => eprintln!("Translation error: {}", e),
+            }
+        }
         Err(e) => eprintln!("Failed to load model: {}", e),
     }
 }

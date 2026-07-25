@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 ort = "2.0.0-rc.12"
+tokenizers = "0.21"
