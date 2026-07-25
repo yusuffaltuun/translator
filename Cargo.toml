@@ -3,6 +3,10 @@ name = "translator"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "translator"
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [dependencies]
 ort = "2.0.0-rc.12"
 tokenizers = "0.21"

@@ -42,3 +42,46 @@ git add src-tauri/ dist/ && git commit -m "chore: initialize tauri v2 scaffoldin
 ```
 
 **Plain English:** Save the Tauri v2 project structure, icons, config, and placeholder frontend.
+
+---
+
+# Micro-Step 2 — Wire Existing Rust Logic into Tauri as Commands
+
+## 1. Summary
+
+Converted the root crate into a library by adding `src/lib.rs` (extracting all selection + translation logic) and replacing `src/main.rs` with a thin binary. Added `translator = { path = ".." }` to `src-tauri/Cargo.toml`. Created two Tauri commands (`read_selection`, `translate`) in `src-tauri/src/lib.rs` with managed `TranslatorState` via `Mutex`. Updated `capabilities/default.json` with window permissions. Both root crate and `src-tauri` crate compile successfully.
+
+## 2. Purpose
+
+The frontend needs to call Rust functions (selection reading, translation) via Tauri's IPC system. By converting the root crate to a library, both the CLI binary and Tauri share identical code without duplication. The `#[tauri::command]` attribute exposes Rust functions as async-callable IPC endpoints from the webview.
+
+## 3. Industry Terms & Concepts
+
+| Term | Definition |
+|------|-----------|
+| **Path dependency** | `translator = { path = ".." }` — Cargo dependency pointing to a local crate on disk rather than crates.io. |
+| **`crate-type = ["lib", "cdylib", "staticlib"]`** | Compiles as a Rust lib, C dynamic lib, and C static lib — needed for both Cargo consumers and FFI/mobile targets. |
+| **`#[tauri::command]`** | Attribute macro that generates IPC serialization/deserialization boilerplate for a Rust function, making it callable from JS. |
+| **`State<'_, T>`** | Tauri's managed state injector. The framework owns the `T` and provides borrows to commands via dependency injection. |
+| **`Mutex<T>`** | Mutual exclusion lock. Required because `Translator::translate()` takes `&mut self` — Tauri commands run on a thread pool. |
+| **`Manager` trait** | Provides `app.manage()`, `app.path()`, etc. Must be imported explicitly in Tauri v2. |
+| **`app.manage()`** | Registers a state object with Tauri's DI container. Later retrieved in commands via `State<'_, T>`. |
+
+## 4. Change Log
+
+| Action | File | Lines |
+|--------|------|-------|
+| **Add** | `src/lib.rs` | 83 lines — public `mod translator`, `DisplayServer` enum, `detect_display_server()`, `read_selection()`, `main()` |
+| **Rewrite** | `src/main.rs` | 94 → 3 lines — thin binary calling `translator::main()` |
+| **Modify** | `Cargo.toml` | Added `[lib]` section with `crate-type = ["lib", "cdylib", "staticlib"]` |
+| **Modify** | `src-tauri/Cargo.toml` | Added `translator = { path = ".." }` dependency |
+| **Rewrite** | `src-tauri/src/lib.rs` | 16 → 65 lines — `TranslatorState`, `read_selection` command, `translate` command, model loading in `setup()` |
+| **Modify** | `src-tauri/capabilities/default.json` | 11 → 18 lines — added window manipulation permissions |
+
+## 5. Git Guidance
+
+```bash
+git add src/lib.rs src/main.rs Cargo.toml src-tauri/Cargo.toml src-tauri/src/lib.rs src-tauri/capabilities/default.json && git commit -m "feat: wire selection and translation logic into tauri commands"
+```
+
+**Plain English:** Save the library conversion, Tauri commands, and capability permissions.
