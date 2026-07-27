@@ -87,34 +87,49 @@ pub fn run() {
             }
 
             // ── Load ONNX model ──
-            let model_path = app
+            // Helsinki-NLP/opus-mt-tc-big-en-tr (Tier 2 upgrade).
+            // Uses separate encoder + decoder ONNX models.
+            // Prefer INT8-quantized models; fall back to FP32.
+            let resource_dir = app
                 .path()
                 .resource_dir()
-                .expect("failed to resolve resource dir")
-                .join("models/model-fp32.onnx");
-            let tokenizer_path = app
-                .path()
-                .resource_dir()
-                .expect("failed to resolve resource dir")
-                .join("models/tokenizer.json");
+                .expect("failed to resolve resource dir");
 
-            let (model_path, tokenizer_path) = if model_path.exists() {
-                (model_path, tokenizer_path)
-            } else {
-                (
-                    std::path::PathBuf::from("models/model-fp32.onnx"),
-                    std::path::PathBuf::from("models/tokenizer.json"),
-                )
+            let (encoder_path, decoder_path, tokenizer_path) = {
+                let int8_enc = resource_dir.join("models/encoder_model_int8.onnx");
+                let int8_dec = resource_dir.join("models/decoder_model_int8.onnx");
+                let fp32_enc = resource_dir.join("models/encoder_model.onnx");
+                let fp32_dec = resource_dir.join("models/decoder_model.onnx");
+                let tok = resource_dir.join("models/tokenizer.json");
+
+                if int8_enc.exists() && int8_dec.exists() {
+                    (int8_enc, int8_dec, tok)
+                } else if fp32_enc.exists() && fp32_dec.exists() {
+                    (fp32_enc, fp32_dec, tok)
+                } else {
+                    // Dev / cargo run fallback — look in crate root
+                    let dev_int8_enc = std::path::PathBuf::from("models/encoder_model_int8.onnx");
+                    let dev_int8_dec = std::path::PathBuf::from("models/decoder_model_int8.onnx");
+                    let dev_fp32_enc = std::path::PathBuf::from("models/encoder_model.onnx");
+                    let dev_fp32_dec = std::path::PathBuf::from("models/decoder_model.onnx");
+                    let dev_tok = std::path::PathBuf::from("models/tokenizer.json");
+                    if dev_int8_enc.exists() && dev_int8_dec.exists() {
+                        (dev_int8_enc, dev_int8_dec, dev_tok)
+                    } else {
+                        (dev_fp32_enc, dev_fp32_dec, dev_tok)
+                    }
+                }
             };
 
-            let model_str = model_path.to_str().unwrap_or("models/model-fp32.onnx");
+            let enc_str = encoder_path.to_str().unwrap_or("models/encoder_model.onnx");
+            let dec_str = decoder_path.to_str().unwrap_or("models/decoder_model.onnx");
             let tok_str = tokenizer_path
                 .to_str()
                 .unwrap_or("models/tokenizer.json");
 
-            let translator = match translator::translator::Translator::load_model(model_str, tok_str) {
+            let translator = match translator::translator::Translator::load_model(enc_str, dec_str, tok_str) {
                 Ok(t) => {
-                    log::info!("ONNX model loaded from: {}", model_str);
+                    log::info!("ONNX models loaded from: {} + {}", enc_str, dec_str);
                     t
                 }
                 Err(e) => {

@@ -70,7 +70,9 @@
     /* ── Source text ── */
     .source {
       padding: 12px 14px 8px;
-      flex-shrink: 0;
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
     }
     .source-label {
       font-size: 10px;
@@ -81,8 +83,7 @@
     }
     .source-text {
       width: 100%;
-      min-height: 38px;
-      max-height: 60px;
+      height: calc(100% - 20px);
       padding: 0;
       border: none;
       border-radius: 6px;

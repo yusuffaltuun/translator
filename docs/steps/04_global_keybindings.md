@@ -1,4 +1,4 @@
-# Step 4 — Global Trigger to Toggle Overlay (Micro-Step 1 of N)
+# Step 4 —  (Micro-Step 1 of N)
 
 ## 1. Summary
 

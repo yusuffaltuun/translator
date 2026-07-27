@@ -87,16 +87,28 @@ pub fn main() {
         Err(e) => eprintln!("Error: {}", e),
     }
 
-    let model_path = "models/model-fp32.onnx";
+    // Prefer INT8-quantized models; fall back to FP32.
+    let (encoder_path, decoder_path) = if std::path::Path::new("models/encoder_model_int8.onnx").exists()
+        && std::path::Path::new("models/decoder_model_int8.onnx").exists()
+    {
+        ("models/encoder_model_int8.onnx", "models/decoder_model_int8.onnx")
+    } else {
+        ("models/encoder_model.onnx", "models/decoder_model.onnx")
+    };
     let tokenizer_path = "models/tokenizer.json";
 
-    match Translator::load_model(model_path, tokenizer_path) {
+    match Translator::load_model(encoder_path, decoder_path, tokenizer_path) {
         Ok(mut translator) => {
-            println!("Model loaded successfully from: {}", model_path);
+            println!("Model loaded successfully from: {} + {}", encoder_path, decoder_path);
 
-            let sample = "Hello, how are you?";
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let sample = if !args.is_empty() {
+                args.join(" ")
+            } else {
+                "Hello, how are you?".to_string()
+            };
             println!("Translating: \"{}\"", sample);
-            match translator.translate(sample) {
+            match translator.translate(&sample) {
                 Ok(translation) => println!("Translation: \"{}\"", translation),
                 Err(e) => eprintln!("Translation error: {}", e),
             }
