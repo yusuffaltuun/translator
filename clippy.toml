@@ -1,8 +1,5 @@
 # For more options: https://rust-lang.github.io/rust-clippy/stable/index.html
 
-# Disable pedantic and nursery lints by default (opt-in via cargo clippy -- -W clippy::pedantic)
-standard-level-overrides = true
-
 # Maximum allowed cyclomatic complexity before triggering `cognitive_complexity`
 cognitive-complexity-threshold = 25
 
