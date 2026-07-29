@@ -1,0 +1,23 @@
+# For more options: https://rust-lang.github.io/rust-clippy/stable/index.html
+
+# Disable pedantic and nursery lints by default (opt-in via cargo clippy -- -W clippy::pedantic)
+standard-level-overrides = true
+
+# Maximum allowed cyclomatic complexity before triggering `cognitive_complexity`
+cognitive-complexity-threshold = 25
+
+# Maximum lines a function can have
+too-many-lines-threshold = 100
+
+# Maximum arguments a function can accept
+too-many-arguments-threshold = 8
+
+# Enforce that `Debug` is implemented on all public types
+# (optional; uncomment if desired)
+# warn-on-all-warnings = true
+
+# Disallow certain patterns
+disallowed-methods = [
+    "std::mem::uninitialized",
+    "std::mem::forget",
+]

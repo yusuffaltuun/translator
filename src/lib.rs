@@ -88,10 +88,14 @@ pub fn main() {
     }
 
     // Prefer INT8-quantized models; fall back to FP32.
-    let (encoder_path, decoder_path) = if std::path::Path::new("models/encoder_model_int8.onnx").exists()
+    let (encoder_path, decoder_path) = if std::path::Path::new("models/encoder_model_int8.onnx")
+        .exists()
         && std::path::Path::new("models/decoder_model_int8.onnx").exists()
     {
-        ("models/encoder_model_int8.onnx", "models/decoder_model_int8.onnx")
+        (
+            "models/encoder_model_int8.onnx",
+            "models/decoder_model_int8.onnx",
+        )
     } else {
         ("models/encoder_model.onnx", "models/decoder_model.onnx")
     };
@@ -99,7 +103,10 @@ pub fn main() {
 
     match Translator::load_model(encoder_path, decoder_path, tokenizer_path) {
         Ok(mut translator) => {
-            println!("Model loaded successfully from: {} + {}", encoder_path, decoder_path);
+            println!(
+                "Model loaded successfully from: {} + {}",
+                encoder_path, decoder_path
+            );
 
             let args: Vec<String> = std::env::args().skip(1).collect();
             let sample = if !args.is_empty() {

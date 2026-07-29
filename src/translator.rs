@@ -104,8 +104,7 @@ impl Translator {
             .encode(text, true)
             .map_err(|e| format!("tokenization error: {}", e))?;
 
-        let mut input_ids: Vec<i64> =
-            encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let mut input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
         let mut attention_mask: Vec<i64> = encoding
             .get_attention_mask()
             .iter()
@@ -143,14 +142,13 @@ impl Translator {
         let (_, hidden_states_data) = hidden_states_value
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("encoder output extraction error: {}", e))?;
-        let hidden_states_vec: Vec<f32> = hidden_states_data.iter().copied().collect();
+        let hidden_states_vec: Vec<f32> = hidden_states_data.to_vec();
 
         let encoder_hidden_states_tensor =
             Tensor::from_array(([1, seq_len, 1024], hidden_states_vec))
                 .map_err(|e| format!("encoder_hidden_states tensor error: {}", e))?;
-        let enc_attention_mask_tensor =
-            Tensor::from_array(([1, seq_len], attention_mask.clone()))
-                .map_err(|e| format!("decoder encoder_attention_mask tensor error: {}", e))?;
+        let enc_attention_mask_tensor = Tensor::from_array(([1, seq_len], attention_mask.clone()))
+            .map_err(|e| format!("decoder encoder_attention_mask tensor error: {}", e))?;
 
         let mut generated_tokens: Vec<i64> = Vec::new();
         let mut past_key_values: HashMap<String, Vec<f32>> = HashMap::new();
@@ -158,9 +156,8 @@ impl Translator {
 
         for _step in 0..MAX_OUTPUT_LEN {
             let dec_input_len = next_input.len();
-            let dec_input_ids_tensor =
-                Tensor::from_array(([1, dec_input_len], next_input.clone()))
-                    .map_err(|e| format!("decoder input_ids tensor error: {}", e))?;
+            let dec_input_ids_tensor = Tensor::from_array(([1, dec_input_len], next_input.clone()))
+                .map_err(|e| format!("decoder input_ids tensor error: {}", e))?;
 
             let mut decoder_inputs: Vec<(String, ort::value::DynValue)> = vec![
                 ("input_ids".into(), dec_input_ids_tensor.into_dyn()),
@@ -185,8 +182,9 @@ impl Translator {
                             .map_err(|e| format!("past_kv tensor error for {}: {}", name, e))?
                     } else {
                         let shape = [1, NUM_HEADS as i64, 0, HEAD_DIM as i64];
-                        Tensor::<f32>::new(&Allocator::default(), shape)
-                            .map_err(|e| format!("empty past_kv tensor error for {}: {}", name, e))?
+                        Tensor::<f32>::new(&Allocator::default(), shape).map_err(|e| {
+                            format!("empty past_kv tensor error for {}: {}", name, e)
+                        })?
                     };
                     decoder_inputs.push((name, tensor.into_dyn()));
                 }
@@ -229,7 +227,7 @@ impl Translator {
                         let (_, data) = value
                             .try_extract_tensor::<f32>()
                             .map_err(|e| format!("kv cache extraction error: {}", e))?;
-                        past_key_values.insert(cache_name, data.iter().copied().collect());
+                        past_key_values.insert(cache_name, data.to_vec());
                     }
                 }
             }
