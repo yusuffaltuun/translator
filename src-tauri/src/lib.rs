@@ -5,10 +5,12 @@ use axum::{Router, extract::State as AxumState, routing::get};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::WebviewWindow;
 
-struct TranslatorState(Arc<Mutex<translator::translator::Translator>>);
+use translator::translator::DefaultTranslator;
+
+struct TranslatorState(Arc<Mutex<DefaultTranslator>>);
 
 struct AppState {
-    translator: Arc<Mutex<translator::translator::Translator>>,
+    translator: Arc<Mutex<DefaultTranslator>>,
     app: AppHandle,
 }
 
@@ -127,7 +129,7 @@ pub fn run() {
                 .to_str()
                 .unwrap_or("models/tokenizer.json");
 
-            let translator = match translator::translator::Translator::load_model(enc_str, dec_str, tok_str) {
+            let translator = match DefaultTranslator::load_model(enc_str, dec_str, tok_str) {
                 Ok(t) => {
                     log::info!("ONNX models loaded from: {} + {}", enc_str, dec_str);
                     t

@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod traits;
 pub mod translator;
 
 use std::env;
