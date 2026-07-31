@@ -272,7 +272,7 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
         self.tokenizer.decode(&output_ids)
     }
 
-    fn split_into_chunks(text: &str) -> Vec<String> {
+    pub fn split_into_chunks(text: &str) -> Vec<String> {
         let mut chunks: Vec<String> = Vec::new();
         let mut current = String::new();
 
@@ -342,7 +342,6 @@ pub type DefaultTranslator = Translator<HuggingFaceTokenizer, OnnxInferenceEngin
 //  Mocks (testing only)
 // ──────────────────────────────────────────────
 
-#[cfg(test)]
 pub mod mocks {
     use crate::errors::TranslatorError;
     use crate::traits::{InferenceEngine, Tokenizer};
@@ -352,6 +351,12 @@ pub mod mocks {
         pub decode_text: String,
         pub fail_encode: bool,
         pub fail_decode: bool,
+    }
+
+    impl Default for MockTokenizer {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockTokenizer {
@@ -387,6 +392,12 @@ pub mod mocks {
         pub output_ids: Vec<i64>,
         pub fail: bool,
         pub max_source: usize,
+    }
+
+    impl Default for MockInferenceEngine {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl MockInferenceEngine {

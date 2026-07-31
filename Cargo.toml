@@ -12,3 +12,10 @@ ort = "2.0.0-rc.12"
 tokenizers = "0.21"
 log = "0.4"
 thiserror = "2.0.19"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "translator_benches"
+harness = false
