@@ -176,7 +176,7 @@ criterion_group!(
 criterion_group!(
     name = layer3_onnx_inference;
     config = Criterion::default()
-        .sample_size(10)
+        .sample_size(20)
         .measurement_time(std::time::Duration::from_secs(30))
         .warm_up_time(std::time::Duration::from_secs(5));
     targets = bench_onnx_run_inference
@@ -185,7 +185,7 @@ criterion_group!(
 criterion_group!(
     name = layer4_end_to_end;
     config = Criterion::default()
-        .sample_size(10)
+        .sample_size(20)
         .measurement_time(std::time::Duration::from_secs(30))
         .warm_up_time(std::time::Duration::from_secs(5));
     targets = bench_end_to_end_translate
