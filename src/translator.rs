@@ -217,6 +217,307 @@ impl InferenceEngine for OnnxInferenceEngine {
 }
 
 // ──────────────────────────────────────────────
+//  Smart chunking with safety buffer
+// ──────────────────────────────────────────────
+
+/// Hard limit on the number of source tokens the model can accept.
+pub const MAX_MODEL_TOKENS: usize = 512;
+/// Token buffer reserved for special tokens (`<s>`, `</s>`, `<pad>`) and
+/// future context overlap.
+pub const SAFETY_MARGIN: usize = 32;
+/// Effective per-chunk limit after reserving the safety margin.
+pub const TARGET_CHUNK_TOKENS: usize = MAX_MODEL_TOKENS - SAFETY_MARGIN;
+
+/// Sentence- and paragraph-ending punctuation, in descending priority.
+const SENTENCE_ENDERS: &[char] = &['.', '!', '?', ';'];
+
+/// Boundary levels used during chunking, ordered by decreasing preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    Paragraph,
+    Line,
+    Sentence,
+    Word,
+}
+
+impl Boundary {
+    /// The next, lower-priority boundary to fall back to.
+    fn next(self) -> Option<Self> {
+        match self {
+            Boundary::Paragraph => Some(Boundary::Line),
+            Boundary::Line => Some(Boundary::Sentence),
+            Boundary::Sentence => Some(Boundary::Word),
+            Boundary::Word => None,
+        }
+    }
+}
+
+/// Configurable, boundary-aware text chunker.
+///
+/// Splits text into chunks that never exceed `max_model_tokens - safety_margin`
+/// tokens. Breaks are preferred at paragraph (`\n\n`), newline (`\n`) and
+/// sentence (`.!?;`) boundaries; continuous un-punctuated text falls back to
+/// word-level (and finally character-level) splits so the target limit is
+/// always honoured.
+#[derive(Debug, Clone, Copy)]
+pub struct Chunker {
+    max_model_tokens: usize,
+    safety_margin: usize,
+}
+
+impl Default for Chunker {
+    fn default() -> Self {
+        Self {
+            max_model_tokens: MAX_MODEL_TOKENS,
+            safety_margin: SAFETY_MARGIN,
+        }
+    }
+}
+
+impl Chunker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a chunker with explicit model limit and safety margin.
+    pub fn with_limits(max_model_tokens: usize, safety_margin: usize) -> Self {
+        assert!(
+            safety_margin < max_model_tokens,
+            "safety_margin ({safety_margin}) must be smaller than max_model_tokens ({max_model_tokens})"
+        );
+        Self {
+            max_model_tokens,
+            safety_margin,
+        }
+    }
+
+    pub fn max_model_tokens(&self) -> usize {
+        self.max_model_tokens
+    }
+
+    pub fn safety_margin(&self) -> usize {
+        self.safety_margin
+    }
+
+    pub fn target_chunk_tokens(&self) -> usize {
+        self.max_model_tokens - self.safety_margin
+    }
+
+    /// Splits `text` into chunks bounded by the effective target limit.
+    ///
+    /// `count_tokens` reports the token count of a piece of text, letting
+    /// callers plug in a real tokenizer (or a cheap proxy in tests).
+    pub fn split<E>(
+        &self,
+        text: &str,
+        count_tokens: impl Fn(&str) -> Result<usize, E>,
+    ) -> Result<Vec<String>, E> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let target = self.target_chunk_tokens();
+        if count_tokens(text)? <= target {
+            return Ok(vec![text.to_string()]);
+        }
+
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_tokens = 0usize;
+
+        self.pack_at_level(
+            &split_keeping_separator(text, "\n\n"),
+            Boundary::Paragraph,
+            &mut chunks,
+            &mut current,
+            &mut current_tokens,
+            &count_tokens,
+        )?;
+
+        if current_tokens > 0 {
+            chunks.push(current.trim().to_string());
+        }
+
+        if chunks.is_empty() {
+            chunks.push(text.to_string());
+        }
+
+        Ok(chunks)
+    }
+
+    /// Greedily packs `units` into chunks, descending to lower-priority
+    /// boundaries whenever a single unit overflows the target.
+    fn pack_at_level<E>(
+        &self,
+        units: &[String],
+        level: Boundary,
+        chunks: &mut Vec<String>,
+        current: &mut String,
+        current_tokens: &mut usize,
+        count_tokens: &dyn Fn(&str) -> Result<usize, E>,
+    ) -> Result<(), E> {
+        let target = self.target_chunk_tokens();
+
+        for unit in units {
+            if unit.trim().is_empty() {
+                continue;
+            }
+            let unit_tokens = count_tokens(unit)?;
+
+            if unit_tokens > target {
+                flush_chunk(chunks, current, current_tokens);
+                match level.next() {
+                    Some(next) if next != Boundary::Word => {
+                        let sub = match next {
+                            Boundary::Paragraph | Boundary::Line => {
+                                split_keeping_separator(unit, "\n")
+                            }
+                            Boundary::Sentence => {
+                                split_keeping_separator_chars(unit, SENTENCE_ENDERS)
+                            }
+                            Boundary::Word => unreachable!(),
+                        };
+                        self.pack_at_level(
+                            &sub,
+                            next,
+                            chunks,
+                            current,
+                            current_tokens,
+                            count_tokens,
+                        )?;
+                    }
+                    _ => {
+                        for piece in split_at_word_boundaries(unit, target, count_tokens)? {
+                            chunks.push(piece);
+                        }
+                    }
+                }
+            } else if *current_tokens == 0 {
+                *current = unit.clone();
+                *current_tokens = unit_tokens;
+            } else if *current_tokens + unit_tokens <= target {
+                current.push_str(unit);
+                *current_tokens += unit_tokens;
+            } else {
+                flush_chunk(chunks, current, current_tokens);
+                *current = unit.clone();
+                *current_tokens = unit_tokens;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn flush_chunk(chunks: &mut Vec<String>, current: &mut String, current_tokens: &mut usize) {
+    if *current_tokens > 0 {
+        chunks.push(current.trim().to_string());
+        current.clear();
+        *current_tokens = 0;
+    }
+}
+
+/// Splits `text` at every occurrence of `sep`, keeping the separator attached
+/// to the piece that precedes it.
+fn split_keeping_separator(text: &str, sep: &str) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while let Some(idx) = rest.find(sep) {
+        let end = idx + sep.len();
+        pieces.push(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() {
+        pieces.push(rest.to_string());
+    }
+    pieces
+}
+
+/// Splits `text` after every occurrence of any char in `seps`, keeping the
+/// punctuation attached to the piece that precedes it.
+fn split_keeping_separator_chars(text: &str, seps: &[char]) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for (idx, ch) in text.char_indices() {
+        if seps.contains(&ch) {
+            let end = idx + ch.len_utf8();
+            pieces.push(text[start..end].to_string());
+            start = end;
+        }
+    }
+    if start < text.len() {
+        pieces.push(text[start..].to_string());
+    }
+    pieces
+}
+
+/// Fallback split that strictly honours `target` by breaking only at
+/// whitespace/word boundaries.
+fn split_at_word_boundaries<E>(
+    text: &str,
+    target: usize,
+    count_tokens: &dyn Fn(&str) -> Result<usize, E>,
+) -> Result<Vec<String>, E> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_tokens = 0usize;
+
+    for word in words {
+        let word_tokens = count_tokens(word)?;
+        if word_tokens > target {
+            if current_tokens > 0 {
+                pieces.push(current.trim().to_string());
+                current.clear();
+                current_tokens = 0;
+            }
+            for piece in split_at_char_boundaries(word, target, count_tokens)? {
+                pieces.push(piece);
+            }
+            continue;
+        }
+        if current_tokens > 0 && current_tokens + word_tokens > target {
+            pieces.push(current.trim().to_string());
+            current.clear();
+            current_tokens = 0;
+        }
+        if current_tokens > 0 {
+            current.push(' ');
+        }
+        current.push_str(word);
+        current_tokens += word_tokens;
+    }
+
+    if current_tokens > 0 {
+        pieces.push(current.trim().to_string());
+    }
+
+    Ok(pieces)
+}
+
+/// Last-resort split used when a single word alone exceeds the target.
+fn split_at_char_boundaries<E>(
+    text: &str,
+    target: usize,
+    count_tokens: &dyn Fn(&str) -> Result<usize, E>,
+) -> Result<Vec<String>, E> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if !current.is_empty() && count_tokens(&current)? >= target {
+            pieces.push(current.clone());
+            current.clear();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    Ok(pieces)
+}
+
+// ──────────────────────────────────────────────
 //  Translator (generic)
 // ──────────────────────────────────────────────
 
@@ -235,7 +536,10 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
             return Err(TranslatorError::EmptyInput);
         }
 
-        let chunks = Self::split_into_chunks(text);
+        let chunker = Chunker::with_limits(self.engine.max_source_len(), SAFETY_MARGIN);
+        let chunks = chunker.split(text, |piece| -> Result<usize, TranslatorError> {
+            Ok(self.tokenizer.encode(piece)?.len())
+        })?;
 
         log::info!(
             "Split input ({} chars) into {} chunk(s)",
@@ -272,55 +576,18 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
         self.tokenizer.decode(&output_ids)
     }
 
+    /// Splits text into chunks bounded by [`TARGET_CHUNK_TOKENS`], preferring
+    /// sentence/paragraph boundaries.
+    ///
+    /// Uses a whitespace word count as a token proxy so it works without a
+    /// tokenizer; [`Translator::translate`] performs tokenizer-accurate
+    /// chunking through [`Chunker`].
     pub fn split_into_chunks(text: &str) -> Vec<String> {
-        let mut chunks: Vec<String> = Vec::new();
-        let mut current = String::new();
-
-        for ch in text.chars() {
-            current.push(ch);
-
-            let dominated_by_sentence_end = current.ends_with(". ")
-                || current.ends_with("! ")
-                || current.ends_with("? ")
-                || current.ends_with(".\n")
-                || current.ends_with("!\n")
-                || current.ends_with("?\n");
-            let dominated_by_newline = current.ends_with("\n\n");
-
-            if dominated_by_sentence_end || dominated_by_newline {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    chunks.push(trimmed);
-                }
-                current.clear();
-            }
-        }
-
-        let remainder = current.trim().to_string();
-        if !remainder.is_empty() {
-            chunks.push(remainder);
-        }
-
-        if chunks.is_empty() {
-            chunks.push(text.trim().to_string());
-        }
-
-        let mut merged: Vec<String> = Vec::new();
-        for chunk in chunks {
-            let word_count = chunk.split_whitespace().count();
-            if word_count < 4 && !merged.is_empty() {
-                let prev = merged.pop().unwrap();
-                merged.push(format!("{} {}", prev, chunk));
-            } else if !chunk.is_empty() {
-                merged.push(chunk);
-            }
-        }
-
-        if merged.is_empty() {
-            merged.push(text.trim().to_string());
-        }
-
-        merged
+        let estimator: fn(&str) -> Result<usize, std::convert::Infallible> =
+            |piece| Ok(piece.split_whitespace().count());
+        Chunker::default()
+            .split(text, estimator)
+            .unwrap_or_else(|_| vec![text.trim().to_string()])
     }
 }
 
@@ -486,5 +753,180 @@ pub mod mocks {
             "Hello. How are you? I am fine.",
         );
         assert!(!chunks.is_empty());
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Smart chunking tests
+// ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod chunking_tests {
+    use super::{Chunker, MAX_MODEL_TOKENS, SAFETY_MARGIN, SENTENCE_ENDERS, TARGET_CHUNK_TOKENS};
+
+    /// Token proxy: count whitespace-separated words.
+    fn count_words(text: &str) -> Result<usize, std::convert::Infallible> {
+        Ok(text.split_whitespace().count())
+    }
+
+    /// Token proxy: count characters.
+    fn count_chars(text: &str) -> Result<usize, std::convert::Infallible> {
+        Ok(text.chars().count())
+    }
+
+    fn count_with(
+        chunker: &Chunker,
+        text: &str,
+        count: fn(&str) -> Result<usize, std::convert::Infallible>,
+    ) -> Vec<String> {
+        chunker.split(text, count).unwrap()
+    }
+
+    /// Builds a paragraph of `n` copies of `word` separated by spaces.
+    fn paragraph(word: &str, n: usize) -> String {
+        std::iter::repeat_n(word, n).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Builds a sentence of `n` words terminated by sentence punctuation.
+    fn sentence(word: &str, n: usize) -> String {
+        format!("{}.", paragraph(word, n))
+    }
+
+    #[test]
+    fn test_constants_reserve_safety_margin() {
+        assert_eq!(MAX_MODEL_TOKENS, 512);
+        assert_eq!(SAFETY_MARGIN, 32);
+        assert_eq!(TARGET_CHUNK_TOKENS, 480);
+    }
+
+    #[test]
+    fn test_short_text_is_single_chunk() {
+        let chunker = Chunker::default();
+        let chunks = count_with(&chunker, "Hello world. This is a short text!", count_words);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "Hello world. This is a short text!");
+    }
+
+    #[test]
+    fn test_empty_text_yields_no_chunks() {
+        let chunker = Chunker::default();
+        assert!(count_with(&chunker, "   \n  ", count_words).is_empty());
+    }
+
+    #[test]
+    fn test_paragraph_boundaries_respected() {
+        let chunker = Chunker::default();
+        let text = format!(
+            "{}\n\n{}\n\n{}",
+            paragraph("alpha", 200),
+            paragraph("beta", 200),
+            paragraph("gamma", 200),
+        );
+        let chunks = count_with(&chunker, &text, count_words);
+
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected two paragraph-aligned chunks: {chunks:?}"
+        );
+        assert_eq!(
+            chunks[0].split("\n\n").count(),
+            2,
+            "chunk 0 must contain whole paragraphs only"
+        );
+        assert_eq!(
+            chunks[1].split("\n\n").count(),
+            1,
+            "chunk 1 must contain whole paragraphs only"
+        );
+        for chunk in &chunks {
+            assert!(chunk.split_whitespace().count() <= chunker.target_chunk_tokens());
+        }
+    }
+
+    #[test]
+    fn test_sentence_boundaries_respected() {
+        let chunker = Chunker::default();
+        let text = (0..20)
+            .map(|i| sentence(&format!("word{i}"), 40))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let chunks = count_with(&chunker, &text, count_words);
+
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(chunk.split_whitespace().count() <= chunker.target_chunk_tokens());
+            let trimmed = chunk.trim_end();
+            assert!(
+                trimmed.ends_with(SENTENCE_ENDERS),
+                "chunk must break at a sentence boundary: {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_giant_unpunctuated_sentence_falls_back_to_word_splits() {
+        let chunker = Chunker::default();
+        let text = (0..1000)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text.split_whitespace().count(), 1000);
+
+        let chunks = count_with(&chunker, &text, count_words);
+
+        assert_eq!(
+            chunks.len(),
+            3,
+            "1000 words should split into 3 word-boundary chunks: {chunks:?}"
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.split_whitespace().count() <= chunker.target_chunk_tokens(),
+                "chunk exceeds target limit: {chunk:?}"
+            );
+        }
+        let reconstructed = chunks.join(" ");
+        assert_eq!(
+            reconstructed, text,
+            "word-boundary fallback must not lose content"
+        );
+    }
+
+    #[test]
+    fn test_no_chunk_exceeds_target_for_mixed_text() {
+        let chunker = Chunker::with_limits(100, 20);
+        let text = format!(
+            "{}\n\n{}\n{} {}\n\n{}",
+            sentence("first", 40),
+            sentence("second", 40),
+            sentence("third", 40),
+            sentence("fourth", 40),
+            sentence("fifth", 40),
+        );
+        let chunks = count_with(&chunker, &text, count_words);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(
+                chunk.split_whitespace().count() <= chunker.target_chunk_tokens(),
+                "chunk exceeds target limit: {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_word_exceeding_target_is_hard_split() {
+        let chunker = Chunker::with_limits(100, 20);
+        let word = "x".repeat(600);
+        let chunks = count_with(&chunker, &word, count_chars);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= chunker.target_chunk_tokens(),
+                "chunk exceeds target limit: {chunk:?}"
+            );
+        }
+        let reconstructed: String = chunks.concat();
+        assert_eq!(reconstructed, word);
     }
 }
