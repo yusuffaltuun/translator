@@ -74,7 +74,7 @@ impl OnnxInferenceEngine {
         Ok(Self {
             encoder,
             decoder,
-            max_source_len: 512,
+            max_source_len: MAX_MODEL_TOKENS,
         })
     }
 
@@ -82,27 +82,38 @@ impl OnnxInferenceEngine {
         self.max_source_len = max;
         self
     }
-}
 
-impl InferenceEngine for OnnxInferenceEngine {
-    fn max_source_len(&self) -> usize {
-        self.max_source_len
-    }
+    /// Runs the encoder over a batch of padded sequences and returns the
+    /// `last_hidden_state` tensor (`[batch, seq_len, D_MODEL]`) together with
+    /// the attention-mask tensor (`[batch, seq_len]`).
+    fn encode_input(
+        &mut self,
+        input_ids: &[Vec<i64>],
+        attention_mask: &[Vec<i64>],
+    ) -> Result<(Tensor<f32>, Tensor<i64>), TranslatorError> {
+        let batch_size = input_ids.len();
+        let source_len = input_ids[0].len();
 
-    fn run_inference(&mut self, input_ids: &[i64]) -> Result<Vec<i64>, TranslatorError> {
-        let source_len = input_ids.len();
-        let attention_mask: Vec<i64> = vec![1i64; source_len];
+        let mut ids_flat = Vec::with_capacity(batch_size * source_len);
+        for row in input_ids {
+            ids_flat.extend_from_slice(row);
+        }
+        let mut mask_flat = Vec::with_capacity(batch_size * source_len);
+        for row in attention_mask {
+            mask_flat.extend_from_slice(row);
+        }
 
-        // ── Encoder forward pass ──
-        let input_ids_tensor = Tensor::from_array(([1, source_len], input_ids.to_vec()))
+        let input_ids_tensor = Tensor::from_array(([batch_size, source_len], ids_flat))
             .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
-        let attention_mask_tensor =
-            Tensor::from_array(([1, source_len], attention_mask.clone()))
-                .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
+        let attention_mask_tensor = Tensor::from_array(([batch_size, source_len], mask_flat))
+            .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
 
         let encoder_inputs: Vec<(String, ort::value::DynValue)> = vec![
             ("input_ids".into(), input_ids_tensor.into_dyn()),
-            ("attention_mask".into(), attention_mask_tensor.into_dyn()),
+            (
+                "attention_mask".into(),
+                attention_mask_tensor.clone().into_dyn(),
+            ),
         ];
         let encoder_outputs = self
             .encoder
@@ -116,44 +127,59 @@ impl InferenceEngine for OnnxInferenceEngine {
         let hidden_states_vec: Vec<f32> = hidden_states_data.to_vec();
 
         let encoder_hidden_states_tensor =
-            Tensor::from_array(([1, source_len, D_MODEL], hidden_states_vec))
+            Tensor::from_array(([batch_size, source_len, D_MODEL], hidden_states_vec))
                 .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
-        let enc_attention_mask_tensor = Tensor::from_array(([1, source_len], attention_mask))
-            .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
 
-        // ── Autoregressive decoder loop ──
-        let mut generated_tokens: Vec<i64> = Vec::new();
+        Ok((encoder_hidden_states_tensor, attention_mask_tensor))
+    }
+
+    /// Autoregressively decodes a batch in lock-step, returning one generated
+    /// token sequence per batch item (stripped of start/pad tokens).
+    fn decode(
+        &mut self,
+        encoder_hidden_states: &Tensor<f32>,
+        enc_attention_mask: &Tensor<i64>,
+        batch_size: usize,
+    ) -> Result<Vec<Vec<i64>>, TranslatorError> {
+        let mut generated: Vec<Vec<i64>> = vec![Vec::new(); batch_size];
+        let mut finished: Vec<bool> = vec![false; batch_size];
+        let mut remaining = batch_size;
         let mut past_key_values: HashMap<String, Vec<f32>> = HashMap::new();
-        let mut next_input: Vec<i64> = vec![DECODER_START_TOKEN_ID];
+        let mut next_input: Vec<i64> = vec![DECODER_START_TOKEN_ID; batch_size];
 
         for _step in 0..MAX_OUTPUT_LEN {
-            let dec_input_len = next_input.len();
-            let dec_input_ids_tensor = Tensor::from_array(([1, dec_input_len], next_input.clone()))
+            if remaining == 0 {
+                break;
+            }
+
+            // Only the newest token per item is fed each step (dec_input_len = 1).
+            let dec_input_ids_tensor = Tensor::from_array(([batch_size, 1], next_input.clone()))
                 .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
 
             let mut decoder_inputs: Vec<(String, ort::value::DynValue)> = vec![
                 ("input_ids".into(), dec_input_ids_tensor.into_dyn()),
                 (
                     "encoder_attention_mask".into(),
-                    enc_attention_mask_tensor.clone().into_dyn(),
+                    enc_attention_mask.clone().into_dyn(),
                 ),
                 (
                     "encoder_hidden_states".into(),
-                    encoder_hidden_states_tensor.clone().into_dyn(),
+                    encoder_hidden_states.clone().into_dyn(),
                 ),
             ];
 
             for layer in 0..NUM_LAYERS {
                 for suffix in &["key", "value"] {
                     let name = format!("past_key_values.{}.decoder.{}", layer, suffix);
-                    let cached = past_key_values.get(&name);
-
-                    let tensor = if let Some(data) = cached {
-                        let seq_len = data.len() / (NUM_HEADS * HEAD_DIM);
-                        Tensor::from_array(([1, NUM_HEADS, seq_len, HEAD_DIM], data.clone()))
-                            .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?
+                    let tensor = if let Some(data) = past_key_values.get(&name) {
+                        let seq_len = data.len() / (batch_size * NUM_HEADS * HEAD_DIM);
+                        Tensor::from_array((
+                            [batch_size, NUM_HEADS, seq_len, HEAD_DIM],
+                            data.clone(),
+                        ))
+                        .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?
                     } else {
-                        let shape = [1, NUM_HEADS as i64, 0, HEAD_DIM as i64];
+                        let shape = [batch_size as i64, NUM_HEADS as i64, 0, HEAD_DIM as i64];
                         Tensor::<f32>::new(&Allocator::default(), shape)
                             .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?
                     };
@@ -171,22 +197,33 @@ impl InferenceEngine for OnnxInferenceEngine {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| TranslatorError::EngineExecutionFailed { source: e })?;
 
-            let vocab_size = logits_data.len() / dec_input_len;
-            let last_token_logits =
-                &logits_data[(dec_input_len - 1) * vocab_size..dec_input_len * vocab_size];
-
-            let mut best_token = 0u32;
-            let mut best_score = f32::NEG_INFINITY;
-            for (i, &score) in last_token_logits.iter().enumerate() {
-                let token = i as u32;
-                if score > best_score && token > 0 {
-                    best_score = score;
-                    best_token = token;
+            // logits shape is [batch, 1, vocab], laid out row-major.
+            let vocab_size = logits_data.len() / batch_size;
+            for b in 0..batch_size {
+                if finished[b] {
+                    continue;
                 }
-            }
+                let start = b * vocab_size;
+                let last_token_logits = &logits_data[start..start + vocab_size];
 
-            if best_token == EOS_TOKEN_ID || best_token == PAD_TOKEN_ID {
-                break;
+                let mut best_token = 0u32;
+                let mut best_score = f32::NEG_INFINITY;
+                for (i, &score) in last_token_logits.iter().enumerate() {
+                    let token = i as u32;
+                    if score > best_score && token > 0 {
+                        best_score = score;
+                        best_token = token;
+                    }
+                }
+
+                if best_token == EOS_TOKEN_ID || best_token == PAD_TOKEN_ID {
+                    finished[b] = true;
+                    remaining -= 1;
+                    next_input[b] = EOS_TOKEN_ID as i64;
+                } else {
+                    generated[b].push(best_token as i64);
+                    next_input[b] = best_token as i64;
+                }
             }
 
             for layer in 0..NUM_LAYERS {
@@ -202,17 +239,67 @@ impl InferenceEngine for OnnxInferenceEngine {
                     }
                 }
             }
-
-            generated_tokens.push(best_token as i64);
-            next_input = vec![best_token as i64];
         }
 
-        if generated_tokens.first() == Some(&DECODER_START_TOKEN_ID) {
-            generated_tokens.remove(0);
+        for tokens in &mut generated {
+            if tokens.first() == Some(&DECODER_START_TOKEN_ID) {
+                tokens.remove(0);
+            }
+            tokens.retain(|&t| t != PAD_TOKEN_ID as i64);
         }
-        generated_tokens.retain(|&t| t != PAD_TOKEN_ID as i64);
 
-        Ok(generated_tokens)
+        Ok(generated)
+    }
+}
+
+impl InferenceEngine for OnnxInferenceEngine {
+    fn max_source_len(&self) -> usize {
+        self.max_source_len
+    }
+
+    fn run_inference(&mut self, input_ids: &[i64]) -> Result<Vec<i64>, TranslatorError> {
+        let batch = vec![input_ids.to_vec()];
+        let mask = vec![vec![1i64; input_ids.len()]];
+        let (encoder_hidden_states, enc_attention_mask) = self.encode_input(&batch, &mask)?;
+        let mut outputs = self.decode(&encoder_hidden_states, &enc_attention_mask, 1)?;
+        Ok(outputs.remove(0))
+    }
+
+    fn run_inference_batch(
+        &mut self,
+        input_ids: &[Vec<i64>],
+        attention_mask: &[Vec<i64>],
+    ) -> Result<Vec<Vec<i64>>, TranslatorError> {
+        let batch_size = input_ids.len();
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        if batch_size != attention_mask.len() {
+            return Err(TranslatorError::InvalidBatchLength {
+                expected: batch_size,
+                actual: attention_mask.len(),
+            });
+        }
+
+        let source_len = input_ids[0].len();
+        for (row, mask_row) in input_ids.iter().zip(attention_mask.iter()) {
+            if row.len() != source_len {
+                return Err(TranslatorError::InvalidBatchLength {
+                    expected: source_len,
+                    actual: row.len(),
+                });
+            }
+            if mask_row.len() != source_len {
+                return Err(TranslatorError::InvalidBatchLength {
+                    expected: source_len,
+                    actual: mask_row.len(),
+                });
+            }
+        }
+
+        let (encoder_hidden_states, enc_attention_mask) =
+            self.encode_input(input_ids, attention_mask)?;
+        self.decode(&encoder_hidden_states, &enc_attention_mask, batch_size)
     }
 }
 
@@ -518,17 +605,174 @@ fn split_at_char_boundaries<E>(
 }
 
 // ──────────────────────────────────────────────
+//  Length bucketing & batching
+// ──────────────────────────────────────────────
+
+/// A padded batch ready for inference.
+#[derive(Debug, Clone)]
+pub struct ChunkBatch {
+    /// Original chunk indices, in the order the rows appear in [`ChunkBatch::input_ids`].
+    pub order: Vec<usize>,
+    /// Padded token ids, shape `[batch_size, max_len]`.
+    pub input_ids: Vec<Vec<i64>>,
+    /// Attention mask: `1` for real tokens, `0` for padding.
+    pub attention_mask: Vec<Vec<i64>>,
+    /// Padded sequence length shared by every row.
+    pub max_len: usize,
+}
+
+/// Groups chunks into length-bucketed batches of at most `batch_size`.
+///
+/// Chunks are sorted by token length first so that similar-length sequences
+/// share a batch and zero-padding is minimised. Each batch is padded with
+/// `pad_id` up to its longest sequence and given a matching attention mask.
+/// [`ChunkBatch::order`] records each chunk's original index so decoded
+/// outputs can be stitched back in source order.
+pub fn build_batches(
+    chunks: &[(usize, Vec<i64>)],
+    batch_size: usize,
+    pad_id: i64,
+) -> Vec<ChunkBatch> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    let batch_size = batch_size.max(1);
+
+    let mut sorted: Vec<(usize, Vec<i64>)> = chunks.to_vec();
+    sorted.sort_by_key(|(index, ids)| (ids.len(), *index));
+
+    let mut batches: Vec<ChunkBatch> = Vec::new();
+    for group in sorted.chunks(batch_size) {
+        let max_len = group.iter().map(|(_, ids)| ids.len()).max().unwrap_or(0);
+        let mut order = Vec::with_capacity(group.len());
+        let mut input_ids = Vec::with_capacity(group.len());
+        let mut attention_mask = Vec::with_capacity(group.len());
+
+        for (index, ids) in group {
+            order.push(*index);
+            let mut padded = ids.clone();
+            padded.resize(max_len, pad_id);
+            input_ids.push(padded);
+            attention_mask.push(mask_for(ids.len(), max_len));
+        }
+
+        batches.push(ChunkBatch {
+            order,
+            input_ids,
+            attention_mask,
+            max_len,
+        });
+    }
+
+    batches
+}
+
+/// Builds the attention mask for a row: `1` for the first `real_len`
+/// positions, `0` for the remaining `max_len - real_len` padding.
+fn mask_for(real_len: usize, max_len: usize) -> Vec<i64> {
+    let mut mask = vec![1i64; real_len];
+    mask.resize(max_len, 0i64);
+    mask
+}
+
+// ──────────────────────────────────────────────
+//  Auto-probing & dynamic batch size detection
+// ──────────────────────────────────────────────
+
+/// Default ceiling for automatic batch-size probing.
+pub const DEFAULT_MAX_BATCH_SIZE: usize = 8;
+
+/// Batch sizes to probe: `1, 2, 4, 8, ...` up to and including `max`.
+fn probe_sizes(max: usize) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    let mut size = 1usize;
+    while size <= max {
+        sizes.push(size);
+        match size.checked_mul(2) {
+            Some(next) => size = next,
+            None => break,
+        }
+    }
+    sizes
+}
+
+/// Runs a single probe inference at `batch_size`, returning `Ok` when the
+/// engine accepts the batch shape.
+fn run_probe<E: InferenceEngine>(engine: &mut E, batch_size: usize) -> Result<(), TranslatorError> {
+    let input: Vec<Vec<i64>> = vec![vec![1i64, 2, 3, 4]; batch_size];
+    let mask: Vec<Vec<i64>> = vec![vec![1i64; 4]; batch_size];
+    engine.run_inference_batch(&input, &mask).map(|_| ())
+}
+
+/// Probes batch sizes `1 -> 2 -> 4 -> ...` (up to `max_batch_size`) and returns
+/// the largest working batch size.
+///
+/// Recoverable execution errors (out of memory, unsupported tensor shapes,
+/// execution-provider dynamic-shape failures) stop probing and fall back to the
+/// last known working size. All other errors are considered unrecoverable and
+/// are propagated immediately so callers fail fast.
+pub fn probe_batch_size<E: InferenceEngine>(
+    engine: &mut E,
+    max_batch_size: usize,
+) -> Result<usize, TranslatorError> {
+    let mut working = 1usize;
+    for size in probe_sizes(max_batch_size).into_iter().skip(1) {
+        match run_probe(engine, size) {
+            Ok(()) => {
+                log::info!("Probe: batch size {size} OK");
+                working = size;
+            }
+            Err(e) if e.is_recoverable_batch_error() => {
+                log::warn!("Probe: batch size {size} failed ({e}); falling back to {working}");
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(working)
+}
+
+// ──────────────────────────────────────────────
 //  Translator (generic)
 // ──────────────────────────────────────────────
 
 pub struct Translator<T: Tokenizer, E: InferenceEngine> {
     tokenizer: T,
     engine: E,
+    max_batch_size: Option<usize>,
+    probed_batch_size: Option<usize>,
 }
 
 impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
     pub fn new(tokenizer: T, engine: E) -> Self {
-        Self { tokenizer, engine }
+        Self {
+            tokenizer,
+            engine,
+            max_batch_size: None,
+            probed_batch_size: None,
+        }
+    }
+
+    /// Sets an optional ceiling for auto-probed batch sizes.
+    pub fn with_max_batch_size(mut self, max: usize) -> Self {
+        self.max_batch_size = Some(max.max(1));
+        self
+    }
+
+    /// The batch size determined by probing, if probing has run.
+    pub fn probed_batch_size(&self) -> Option<usize> {
+        self.probed_batch_size
+    }
+
+    /// Probes the engine for a working batch size and caches the result.
+    pub fn probe_batch_size(&mut self) -> Result<usize, TranslatorError> {
+        if let Some(size) = self.probed_batch_size {
+            return Ok(size);
+        }
+        let max = self.max_batch_size.unwrap_or(DEFAULT_MAX_BATCH_SIZE);
+        let size = probe_batch_size(&mut self.engine, max)?;
+        self.probed_batch_size = Some(size);
+        Ok(size)
     }
 
     pub fn translate(&mut self, text: &str) -> Result<String, TranslatorError> {
@@ -537,9 +781,7 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
         }
 
         let chunker = Chunker::with_limits(self.engine.max_source_len(), SAFETY_MARGIN);
-        let chunks = chunker.split(text, |piece| -> Result<usize, TranslatorError> {
-            Ok(self.tokenizer.encode(piece)?.len())
-        })?;
+        let chunks = chunker.split(text, |piece| self.tokenizer.count_tokens(piece))?;
 
         log::info!(
             "Split input ({} chars) into {} chunk(s)",
@@ -551,13 +793,45 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
             return self.translate_chunk(&chunks[0]);
         }
 
-        let mut results = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.iter().enumerate() {
-            log::info!("Translating chunk {}/{}", i + 1, chunks.len());
-            let translated = self.translate_chunk(chunk)?;
-            results.push(translated);
+        let max_source = self.engine.max_source_len();
+        let mut encoded: Vec<(usize, Vec<i64>)> = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let ids = self.tokenizer.encode(chunk)?;
+            if ids.len() > max_source {
+                return Err(TranslatorError::ContextWindowExceeded {
+                    max: max_source,
+                    actual: ids.len(),
+                });
+            }
+            encoded.push((index, ids));
         }
 
+        let batch_size = self.probe_batch_size()?;
+        log::info!("Probed batch size: {batch_size}");
+
+        let batches = build_batches(&encoded, batch_size, PAD_TOKEN_ID as i64);
+        let mut decoded: Vec<(usize, String)> = Vec::with_capacity(chunks.len());
+
+        for (batch_index, batch) in batches.iter().enumerate() {
+            log::info!(
+                "Translating batch {}/{} ({} sequences, max len {})",
+                batch_index + 1,
+                batches.len(),
+                batch.input_ids.len(),
+                batch.max_len
+            );
+            let outputs = self
+                .engine
+                .run_inference_batch(&batch.input_ids, &batch.attention_mask)?;
+            debug_assert_eq!(outputs.len(), batch.order.len());
+            for (output, &original) in outputs.iter().zip(batch.order.iter()) {
+                let translated = self.tokenizer.decode(output)?;
+                decoded.push((original, translated));
+            }
+        }
+
+        decoded.sort_by_key(|(original, _)| *original);
+        let results: Vec<String> = decoded.into_iter().map(|(_, text)| text).collect();
         Ok(results.join(" "))
     }
 
@@ -618,6 +892,11 @@ pub mod mocks {
         pub decode_text: String,
         pub fail_encode: bool,
         pub fail_decode: bool,
+        /// Encode returns `[word_count]` and token counting uses the real word
+        /// count (used to simulate varying sequence lengths).
+        pub echo_len: bool,
+        /// Decode renders each token as `t{id}` instead of `decode_text`.
+        pub dynamic_decode: bool,
     }
 
     impl Default for MockTokenizer {
@@ -633,22 +912,40 @@ pub mod mocks {
                 decode_text: "mock translation".into(),
                 fail_encode: false,
                 fail_decode: false,
+                echo_len: false,
+                dynamic_decode: false,
             }
         }
     }
 
     impl Tokenizer for MockTokenizer {
-        fn encode(&self, _text: &str) -> Result<Vec<i64>, TranslatorError> {
+        fn count_tokens(&self, text: &str) -> Result<usize, TranslatorError> {
+            if self.echo_len {
+                Ok(text.split_whitespace().count())
+            } else {
+                Ok(self.encode_ids.len())
+            }
+        }
+
+        fn encode(&self, text: &str) -> Result<Vec<i64>, TranslatorError> {
             if self.fail_encode {
                 Err(TranslatorError::EmptyInput)
+            } else if self.echo_len {
+                Ok(vec![text.split_whitespace().count() as i64])
             } else {
                 Ok(self.encode_ids.clone())
             }
         }
 
-        fn decode(&self, _ids: &[i64]) -> Result<String, TranslatorError> {
+        fn decode(&self, ids: &[i64]) -> Result<String, TranslatorError> {
             if self.fail_decode {
                 Err(TranslatorError::EmptyInput)
+            } else if self.dynamic_decode {
+                Ok(ids
+                    .iter()
+                    .map(|id| format!("t{id}"))
+                    .collect::<Vec<_>>()
+                    .join(" "))
             } else {
                 Ok(self.decode_text.clone())
             }
@@ -659,6 +956,14 @@ pub mod mocks {
         pub output_ids: Vec<i64>,
         pub fail: bool,
         pub max_source: usize,
+        /// Batch inference echoes the first token of each padded row.
+        pub echo_input: bool,
+        /// Batch sizes above this fail with a recoverable (OOM-shaped) error.
+        pub max_working_batch: usize,
+        /// When a batch is too large, fail with an unrecoverable error instead.
+        pub unrecoverable_batch_failure: bool,
+        /// Records every batch size passed to [`MockInferenceEngine::run_inference_batch`].
+        pub batch_sizes_seen: Vec<usize>,
     }
 
     impl Default for MockInferenceEngine {
@@ -673,6 +978,10 @@ pub mod mocks {
                 output_ids: vec![4, 5, 6],
                 fail: false,
                 max_source: 512,
+                echo_input: false,
+                max_working_batch: 8,
+                unrecoverable_batch_failure: false,
+                batch_sizes_seen: Vec::new(),
             }
         }
     }
@@ -687,6 +996,38 @@ pub mod mocks {
                 Err(TranslatorError::EmptyInput)
             } else {
                 Ok(self.output_ids.clone())
+            }
+        }
+
+        fn run_inference_batch(
+            &mut self,
+            input_ids: &[Vec<i64>],
+            _attention_mask: &[Vec<i64>],
+        ) -> Result<Vec<Vec<i64>>, TranslatorError> {
+            if self.fail {
+                return Err(TranslatorError::EmptyInput);
+            }
+            let batch_size = input_ids.len();
+            self.batch_sizes_seen.push(batch_size);
+
+            if batch_size > self.max_working_batch {
+                if self.unrecoverable_batch_failure {
+                    return Err(TranslatorError::EngineExecutionFailed {
+                        source: ort::Error::new("Failed to load model: missing model file"),
+                    });
+                }
+                return Err(TranslatorError::EngineExecutionFailed {
+                    source: ort::Error::new("Out of memory allocating tensor shape [8, 512]"),
+                });
+            }
+
+            if self.echo_input {
+                Ok(input_ids
+                    .iter()
+                    .map(|row| row.first().map_or_else(Vec::new, |&token| vec![token]))
+                    .collect())
+            } else {
+                Ok(vec![self.output_ids.clone(); batch_size])
             }
         }
     }
@@ -928,5 +1269,287 @@ mod chunking_tests {
         }
         let reconstructed: String = chunks.concat();
         assert_eq!(reconstructed, word);
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Length bucketing, probing & batch pipeline tests
+// ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod batching_tests {
+    use super::mocks::{MockInferenceEngine, MockTokenizer};
+    use super::{build_batches, probe_batch_size, probe_sizes, Translator};
+    use crate::errors::TranslatorError;
+
+    const PAD: i64 = 57059;
+
+    #[test]
+    fn test_probe_sizes_doubling_sequence() {
+        assert_eq!(probe_sizes(1), vec![1]);
+        assert_eq!(probe_sizes(3), vec![1, 2]);
+        assert_eq!(probe_sizes(8), vec![1, 2, 4, 8]);
+        assert_eq!(probe_sizes(100), vec![1, 2, 4, 8, 16, 32, 64]);
+    }
+
+    #[test]
+    fn test_build_batches_sorts_and_pads() {
+        let chunks = vec![
+            (0, vec![1, 2, 3, 4, 5]),
+            (1, vec![1, 2]),
+            (2, vec![1, 2, 3]),
+            (3, vec![1, 2, 3, 4]),
+        ];
+        let batches = build_batches(&chunks, 2, PAD);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].order, vec![1, 2], "shortest chunks first");
+        assert_eq!(batches[0].max_len, 3);
+        assert_eq!(batches[0].input_ids[0], vec![1, 2, PAD]);
+        assert_eq!(batches[0].attention_mask[0], vec![1, 1, 0]);
+        assert_eq!(batches[0].input_ids[1], vec![1, 2, 3]);
+        assert_eq!(batches[0].attention_mask[1], vec![1, 1, 1]);
+
+        assert_eq!(batches[1].order, vec![3, 0]);
+        assert_eq!(batches[1].max_len, 5);
+        assert_eq!(batches[1].input_ids[0], vec![1, 2, 3, 4, PAD]);
+        assert_eq!(batches[1].attention_mask[0], vec![1, 1, 1, 1, 0]);
+        assert_eq!(batches[1].input_ids[1], vec![1, 2, 3, 4, 5]);
+        assert_eq!(batches[1].attention_mask[1], vec![1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_build_batches_covers_every_chunk_exactly_once() {
+        let chunks: Vec<(usize, Vec<i64>)> = (0..7).map(|i| (i, vec![1i64; i + 1])).collect();
+        let batches = build_batches(&chunks, 3, PAD);
+
+        let mut seen = Vec::new();
+        for batch in &batches {
+            assert!(batch.input_ids.len() <= 3);
+            assert_eq!(batch.input_ids.len(), batch.order.len());
+            assert_eq!(batch.attention_mask.len(), batch.order.len());
+            for (row, mask) in batch.input_ids.iter().zip(batch.attention_mask.iter()) {
+                assert_eq!(row.len(), batch.max_len);
+                assert_eq!(mask.len(), batch.max_len);
+            }
+            seen.extend(batch.order.iter().copied());
+        }
+        seen.sort();
+        assert_eq!(seen, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_build_batches_empty_input() {
+        assert!(build_batches(&[], 4, PAD).is_empty());
+    }
+
+    #[test]
+    fn test_probe_reaches_max_when_all_succeed() {
+        let mut engine = MockInferenceEngine::new();
+        let size = probe_batch_size(&mut engine, 8).unwrap();
+        assert_eq!(size, 8);
+        assert_eq!(engine.batch_sizes_seen, vec![2, 4, 8]);
+    }
+
+    #[test]
+    fn test_probe_falls_back_on_recoverable_error() {
+        let mut engine = MockInferenceEngine {
+            max_working_batch: 2,
+            ..MockInferenceEngine::new()
+        };
+        let size = probe_batch_size(&mut engine, 8).unwrap();
+        assert_eq!(size, 2, "must fall back to the last working batch size");
+        assert_eq!(engine.batch_sizes_seen, vec![2, 4]);
+    }
+
+    #[test]
+    fn test_probe_propagates_unrecoverable_error() {
+        let mut engine = MockInferenceEngine {
+            max_working_batch: 2,
+            unrecoverable_batch_failure: true,
+            ..MockInferenceEngine::new()
+        };
+        let err = probe_batch_size(&mut engine, 8).unwrap_err();
+        assert!(matches!(err, TranslatorError::EngineExecutionFailed { .. }));
+        assert!(!err.is_recoverable_batch_error());
+    }
+
+    #[test]
+    fn test_translator_batches_and_preserves_order() {
+        let tokenizer = MockTokenizer {
+            echo_len: true,
+            dynamic_decode: true,
+            ..MockTokenizer::new()
+        };
+        let engine = MockInferenceEngine {
+            echo_input: true,
+            ..MockInferenceEngine::new()
+        };
+        let mut translator = Translator::new(tokenizer, engine);
+
+        // Three sentences with distinct word counts. Greedy packing produces
+        // two chunks: "S1 S2" (400 words) then "S3" (200 words).
+        let text = format!(
+            "{} {} {}",
+            sentence_of("alpha", 200),
+            sentence_of("beta", 200),
+            sentence_of("gamma", 200),
+        );
+
+        let result = translator.translate(&text).unwrap();
+
+        // Chunk 0 (400 words) encodes to [400] and decodes to "t400"; chunk 1
+        // to "t200". Original order must be preserved despite length sorting.
+        assert_eq!(result, "t400 t200");
+        assert_eq!(translator.probed_batch_size(), Some(8));
+    }
+
+    #[test]
+    fn test_translator_falls_back_after_probe_failure() {
+        let tokenizer = MockTokenizer {
+            echo_len: true,
+            dynamic_decode: true,
+            ..MockTokenizer::new()
+        };
+        let engine = MockInferenceEngine {
+            echo_input: true,
+            max_working_batch: 2,
+            ..MockInferenceEngine::new()
+        };
+        let mut translator = Translator::new(tokenizer, engine);
+
+        let text = format!(
+            "{} {} {}",
+            sentence_of("alpha", 200),
+            sentence_of("beta", 200),
+            sentence_of("gamma", 200),
+        );
+
+        let result = translator.translate(&text).unwrap();
+        assert_eq!(result, "t400 t200");
+        assert_eq!(translator.probed_batch_size(), Some(2));
+    }
+
+    #[test]
+    fn test_translator_propagates_unrecoverable_probe_error() {
+        let tokenizer = MockTokenizer {
+            echo_len: true,
+            ..MockTokenizer::new()
+        };
+        let engine = MockInferenceEngine {
+            max_working_batch: 2,
+            unrecoverable_batch_failure: true,
+            ..MockInferenceEngine::new()
+        };
+        let mut translator = Translator::new(tokenizer, engine);
+
+        let text = format!(
+            "{} {} {}",
+            sentence_of("alpha", 200),
+            sentence_of("beta", 200),
+            sentence_of("gamma", 200),
+        );
+
+        let err = translator.translate(&text).unwrap_err();
+        assert!(matches!(err, TranslatorError::EngineExecutionFailed { .. }));
+        assert!(translator.probed_batch_size().is_none());
+    }
+
+    #[test]
+    fn test_translator_with_max_batch_size_uses_ceiling() {
+        let tokenizer = MockTokenizer {
+            echo_len: true,
+            dynamic_decode: true,
+            ..MockTokenizer::new()
+        };
+        let engine = MockInferenceEngine {
+            echo_input: true,
+            ..MockInferenceEngine::new()
+        };
+        let mut translator = Translator::new(tokenizer, engine).with_max_batch_size(2);
+
+        let text = format!(
+            "{} {} {}",
+            sentence_of("alpha", 200),
+            sentence_of("beta", 200),
+            sentence_of("gamma", 200),
+        );
+
+        let result = translator.translate(&text).unwrap();
+        assert_eq!(result, "t400 t200");
+        assert_eq!(translator.probed_batch_size(), Some(2));
+    }
+
+    /// Builds a sentence of `n` copies of `word`, terminated with a period.
+    fn sentence_of(word: &str, n: usize) -> String {
+        format!(
+            "{}.",
+            std::iter::repeat_n(word, n).collect::<Vec<_>>().join(" ")
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Integration tests (real ONNX model)
+// ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod integration_tests {
+    use std::path::Path;
+
+    use super::{probe_batch_size, OnnxInferenceEngine};
+    use crate::traits::InferenceEngine;
+
+    fn model_paths() -> Option<(&'static str, &'static str)> {
+        let candidates = [
+            (
+                "models/encoder_model_int8.onnx",
+                "models/decoder_model_int8.onnx",
+            ),
+            ("models/encoder_model.onnx", "models/decoder_model.onnx"),
+        ];
+        candidates
+            .iter()
+            .copied()
+            .find(|(enc, dec)| Path::new(enc).exists() && Path::new(dec).exists())
+    }
+
+    #[test]
+    #[ignore = "requires the ONNX models under models/"]
+    fn test_real_engine_batch_inference() {
+        let Some((enc, dec)) = model_paths() else {
+            return;
+        };
+        let mut engine = OnnxInferenceEngine::load(enc, dec).unwrap();
+
+        let input = vec![
+            vec![1i64, 2, 3, 4, 5, 6],
+            vec![1, 2, 3, 57059, 57059, 57059],
+        ];
+        let mask = vec![vec![1i64, 1, 1, 1, 1, 1], vec![1, 1, 1, 0, 0, 0]];
+        let outputs = engine.run_inference_batch(&input, &mask).unwrap();
+        assert_eq!(outputs.len(), 2, "one output sequence per batch item");
+        assert!(!outputs[0].is_empty(), "batch item 0 must generate tokens");
+        assert!(!outputs[1].is_empty(), "batch item 1 must generate tokens");
+
+        let probed = probe_batch_size(&mut engine, 4).unwrap();
+        assert!((1..=4).contains(&probed));
+    }
+
+    #[test]
+    #[ignore = "requires the ONNX models under models/"]
+    fn test_real_engine_rejects_mismatched_batch() {
+        let Some((enc, dec)) = model_paths() else {
+            return;
+        };
+        let mut engine = OnnxInferenceEngine::load(enc, dec).unwrap();
+
+        let input = vec![vec![1i64, 2, 3], vec![4, 5]];
+        let mask = vec![vec![1i64; 3], vec![1, 1, 1]];
+        let err = engine.run_inference_batch(&input, &mask).unwrap_err();
+        assert!(matches!(
+            err,
+            super::TranslatorError::InvalidBatchLength { .. }
+        ));
     }
 }
