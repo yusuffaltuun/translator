@@ -17,5 +17,21 @@ thiserror = "2.0.19"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "translator_benches"
+name = "bench_text_handling"
+harness = false
+
+[[bench]]
+name = "bench_overlap_trimmer"
+harness = false
+
+[[bench]]
+name = "bench_mock_pipeline"
+harness = false
+
+[[bench]]
+name = "bench_onnx_batching"
+harness = false
+
+[[bench]]
+name = "bench_end_to_end"
 harness = false
