@@ -605,6 +605,324 @@ fn split_at_char_boundaries<E>(
 }
 
 // ──────────────────────────────────────────────
+//  Context overlap & conservative trimming
+// ──────────────────────────────────────────────
+
+/// Minimum size of the forward context-overlap window, in words.
+pub const CONTEXT_OVERLAP_MIN_WORDS: usize = 16;
+/// Maximum size of the forward context-overlap window, in words.
+pub const CONTEXT_OVERLAP_MAX_WORDS: usize = 24;
+
+/// Prepends a forward context-overlap window to every chunk `i > 0`.
+///
+/// For each chunk `i > 0`, the last
+/// [`CONTEXT_OVERLAP_MIN_WORDS`..`CONTEXT_OVERLAP_MAX_WORDS`] words of the
+/// previous chunk's *final* body are prepended so the model can see the
+/// boundary context it otherwise lost. The combined `overlap + body` never
+/// exceeds `target` tokens:
+///
+/// 1. the overlap is sized as large as possible within
+///    `[CONTEXT_OVERLAP_MIN_WORDS, CONTEXT_OVERLAP_MAX_WORDS]` while still
+///    leaving room for the full chunk body;
+/// 2. only when even the minimum overlap overflows is the chunk body trimmed
+///    from the front (the tail is kept so the next chunk's overlap stays
+///    intact). This is the conservative last resort — content is never trimmed
+///    when the overlap alone can absorb the overflow.
+pub fn apply_context_overlap<E>(
+    chunks: &[String],
+    count_tokens: &dyn Fn(&str) -> Result<usize, E>,
+    target: usize,
+) -> Result<Vec<String>, E> {
+    let mut bodies: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut augmented: Vec<String> = Vec::with_capacity(chunks.len());
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == 0 {
+            let body = chunk.trim().to_string();
+            bodies.push(body.clone());
+            augmented.push(body);
+            continue;
+        }
+
+        let body_tokens = count_tokens(chunk)?;
+        let prev_words: Vec<&str> = bodies[i - 1].split_whitespace().collect();
+        let max_overlap = CONTEXT_OVERLAP_MAX_WORDS.min(prev_words.len());
+
+        // Prefer the largest overlap that leaves room for the full body.
+        let mut chosen_overlap: Option<String> = None;
+        let mut overlap_size = max_overlap;
+        while overlap_size >= CONTEXT_OVERLAP_MIN_WORDS {
+            let overlap = prev_words[prev_words.len() - overlap_size..].join(" ");
+            let overlap_tokens = count_tokens(&overlap)?;
+            if body_tokens + overlap_tokens <= target {
+                chosen_overlap = Some(overlap);
+                break;
+            }
+            if overlap_size == CONTEXT_OVERLAP_MIN_WORDS {
+                break;
+            }
+            overlap_size -= 1;
+        }
+
+        let (overlap, body) = match chosen_overlap {
+            Some(overlap) => (overlap, chunk.trim().to_string()),
+            None => {
+                let min_overlap = CONTEXT_OVERLAP_MIN_WORDS.min(prev_words.len());
+                let overlap = prev_words[prev_words.len() - min_overlap..].join(" ");
+                let overlap_tokens = count_tokens(&overlap)?;
+                let budget = target.saturating_sub(overlap_tokens);
+                let body = trim_front_to_budget(chunk, budget, count_tokens)?;
+                (overlap, body)
+            }
+        };
+
+        bodies.push(body.clone());
+        let mut combined = overlap;
+        if !combined.is_empty() && !body.is_empty() {
+            combined.push(' ');
+        }
+        combined.push_str(&body);
+        augmented.push(combined);
+    }
+
+    Ok(augmented)
+}
+
+/// Removes words from the front of `text` until its token count fits within
+/// `budget`.
+///
+/// The token count of a word-suffix is (non-strictly) monotonic in the trim
+/// offset, so a binary search finds the smallest feasible offset in `O(log n)`
+/// token counts instead of a linear scan.
+fn trim_front_to_budget<E>(
+    text: &str,
+    budget: usize,
+    count_tokens: &dyn Fn(&str) -> Result<usize, E>,
+) -> Result<String, E> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() || count_tokens(text)? <= budget {
+        return Ok(text.to_string());
+    }
+
+    // `lo` is infeasible (the full text), `hi` (the empty suffix) is feasible.
+    let mut lo = 0usize;
+    let mut hi = words.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if count_tokens(&words[mid..].join(" "))? <= budget {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(words[lo..].join(" "))
+}
+
+/// Common English stop-words. Used to reject weak, stop-word-only overlap
+/// matches that would otherwise mis-trim meaningful translation content.
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "but", "or", "nor", "for", "so", "yet", "if", "then", "else", "of",
+    "to", "in", "on", "at", "by", "with", "from", "into", "upon", "over", "under", "as", "is",
+    "are", "was", "were", "be", "been", "being", "am", "it", "its", "this", "that", "these",
+    "those", "i", "you", "he", "she", "we", "they", "me", "him", "her", "us", "them", "my", "your",
+    "his", "their", "our", "do", "does", "did", "have", "has", "had", "not", "no", "there", "here",
+    "all", "each", "both", "some", "any", "more", "most", "such", "than", "up", "down", "out",
+    "off", "about", "after", "before", "between", "against", "during", "through", "above", "below",
+    "again", "further", "once", "only", "own", "same", "too", "very", "just", "while", "when",
+    "where", "why", "how", "what", "which", "who", "whom", "whose",
+];
+
+fn is_stop_word(word: &str) -> bool {
+    STOP_WORDS.contains(&word)
+}
+
+/// Normalizes a single word for boundary comparison: strips surrounding
+/// punctuation and lowercases. Returns `None` for words that normalize to
+/// nothing.
+fn normalize_word(word: &str) -> Option<String> {
+    let normalized = word
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Removes the first `count` words of `words`, capped at `max_trim`.
+fn trim_first_words(words: &[&str], count: usize, max_trim: usize) -> String {
+    let trimmed = count.min(max_trim).min(words.len());
+    words[trimmed..].join(" ")
+}
+
+/// Classic dynamic-programming Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b.len()]
+}
+
+/// Normalized similarity of two words in `[0, 1]`, scaled by edit distance.
+fn word_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let max_len = a.chars().count().max(b.chars().count());
+    1.0 - (levenshtein(a, b) as f64 / max_len as f64)
+}
+
+/// Mean per-word similarity of two equally-sized word n-grams.
+fn ngram_similarity(a: &[String], b: &[String]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    if a.is_empty() {
+        return 1.0;
+    }
+    let sum: f64 = a.iter().zip(b).map(|(x, y)| word_similarity(x, y)).sum();
+    sum / a.len() as f64
+}
+
+/// Conservatively removes duplicated overlap text from a chunk translation.
+///
+/// After context overlap is prepended to chunk `i`, its translation begins by
+/// re-translating source that chunk `i - 1` already covered. The trimmer
+/// detects that duplicated prefix by comparing the *tail* of chunk `i - 1`'s
+/// output with the *head* of chunk `i`'s output and strips the match.
+///
+/// The decision pipeline is strictly sequential and conservative:
+///
+/// 1. **Normalized boundary exact match** — case/whitespace/punctuation are
+///    normalized and the longest contiguous prefix/suffix match is trimmed.
+/// 2. **Strict multi-word fuzzy match** — if no exact match, `2..=6` word
+///    n-grams are compared with normalized edit-distance similarity; trimming
+///    requires the similarity to clearly exceed the high threshold, a match
+///    anchored at both boundaries, and at least two meaningful (non-stop-word)
+///    words.
+/// 3. **Conservative fallback** — single-word matches, stop-word-only matches,
+///    near-threshold (ambiguous) matches, and everything else is left untrimmed.
+///
+/// All comparisons are restricted to the last `search_window_words` of the
+/// previous output and the first `search_window_words` of the current output,
+/// and no more than `max_trim_words` words are ever removed.
+#[derive(Debug, Clone)]
+pub struct OverlapTrimmer {
+    search_window_words: usize,
+    max_trim_words: usize,
+    ngram_min: usize,
+    ngram_max: usize,
+    similarity_threshold: f64,
+    confidence_margin: f64,
+}
+
+impl Default for OverlapTrimmer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OverlapTrimmer {
+    pub fn new() -> Self {
+        Self {
+            search_window_words: 20,
+            max_trim_words: 20,
+            ngram_min: 2,
+            ngram_max: 6,
+            similarity_threshold: 0.85,
+            confidence_margin: 0.05,
+        }
+    }
+
+    /// Sets the size of the boundary search window (in words) on each side.
+    pub fn with_search_window(mut self, words: usize) -> Self {
+        self.search_window_words = words.max(1);
+        self
+    }
+
+    /// Sets the hard upper bound on how many words may be trimmed.
+    pub fn with_max_trim_words(mut self, words: usize) -> Self {
+        self.max_trim_words = words.max(1);
+        self
+    }
+
+    /// Trims duplicated overlap text from the head of `cur_output`, using
+    /// `prev_output` as the reference for what was already translated.
+    pub fn trim(&self, prev_output: &str, cur_output: &str) -> String {
+        let prev_words: Vec<&str> = prev_output.split_whitespace().collect();
+        let cur_words: Vec<&str> = cur_output.split_whitespace().collect();
+        if prev_words.is_empty() || cur_words.len() <= 1 {
+            return cur_output.to_string();
+        }
+
+        let prev_norm: Vec<String> = prev_words
+            .iter()
+            .filter_map(|w| normalize_word(w))
+            .collect();
+        let cur_norm: Vec<String> = cur_words.iter().filter_map(|w| normalize_word(w)).collect();
+        if prev_norm.is_empty() || cur_norm.is_empty() {
+            return cur_output.to_string();
+        }
+
+        let window = self.search_window_words;
+        let pw = &prev_norm[prev_norm.len().saturating_sub(window)..];
+        let cw = &cur_norm[..cur_norm.len().min(window)];
+
+        // 1. Normalized boundary exact match: longest common suffix/prefix.
+        let k_max = pw.len().min(cw.len()).min(self.max_trim_words);
+        let mut exact_k = 0usize;
+        for k in 1..=k_max {
+            if pw[pw.len() - k..] == cw[..k] {
+                exact_k = k;
+            }
+        }
+        if exact_k >= 2 {
+            let matched = &cw[..exact_k];
+            if matched.iter().any(|word| !is_stop_word(word)) {
+                return trim_first_words(&cur_words, exact_k, self.max_trim_words);
+            }
+        }
+
+        // 2. Strict multi-word fuzzy match on 2..=6 word n-grams. Iterate from
+        //    the largest n-gram down so the longest anchored, high-confidence
+        //    span wins. The confidence margin keeps near-border matches out.
+        for n in (self.ngram_min..=self.ngram_max).rev() {
+            if n > pw.len() || n > cw.len() {
+                continue;
+            }
+            let prev_gram = &pw[pw.len() - n..];
+            let cur_gram = &cw[..n];
+            let similarity = ngram_similarity(prev_gram, cur_gram);
+            if similarity < self.similarity_threshold + self.confidence_margin {
+                continue;
+            }
+            let meaningful = cur_gram.iter().filter(|word| !is_stop_word(word)).count();
+            if meaningful < 2 {
+                continue;
+            }
+            return trim_first_words(&cur_words, n, self.max_trim_words);
+        }
+
+        // 3. Conservative fallback: keep the output untouched.
+        cur_output.to_string()
+    }
+}
+
+// ──────────────────────────────────────────────
 //  Length bucketing & batching
 // ──────────────────────────────────────────────
 
@@ -793,9 +1111,21 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
             return self.translate_chunk(&chunks[0]);
         }
 
+        // Prepend a forward context-overlap window to every chunk i > 0 so the
+        // model sees the boundary context, then strip the duplicated re-translation
+        // from each subsequent chunk's output with the conservative OverlapTrimmer.
+        let target = chunker.target_chunk_tokens();
+        let augmented =
+            apply_context_overlap(&chunks, &|piece| self.tokenizer.count_tokens(piece), target)?;
+        let trimmer = OverlapTrimmer::default();
+        log::info!(
+            "Applied context overlap to {} chunk(s); target {target} tokens",
+            augmented.len().saturating_sub(1)
+        );
+
         let max_source = self.engine.max_source_len();
-        let mut encoded: Vec<(usize, Vec<i64>)> = Vec::with_capacity(chunks.len());
-        for (index, chunk) in chunks.iter().enumerate() {
+        let mut encoded: Vec<(usize, Vec<i64>)> = Vec::with_capacity(augmented.len());
+        for (index, chunk) in augmented.iter().enumerate() {
             let ids = self.tokenizer.encode(chunk)?;
             if ids.len() > max_source {
                 return Err(TranslatorError::ContextWindowExceeded {
@@ -810,7 +1140,7 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
         log::info!("Probed batch size: {batch_size}");
 
         let batches = build_batches(&encoded, batch_size, PAD_TOKEN_ID as i64);
-        let mut decoded: Vec<(usize, String)> = Vec::with_capacity(chunks.len());
+        let mut decoded: Vec<(usize, String)> = Vec::with_capacity(augmented.len());
 
         for (batch_index, batch) in batches.iter().enumerate() {
             log::info!(
@@ -831,7 +1161,17 @@ impl<T: Tokenizer, E: InferenceEngine> Translator<T, E> {
         }
 
         decoded.sort_by_key(|(original, _)| *original);
-        let results: Vec<String> = decoded.into_iter().map(|(_, text)| text).collect();
+        let raw_outputs: Vec<String> = decoded.into_iter().map(|(_, text)| text).collect();
+
+        let mut results: Vec<String> = Vec::with_capacity(raw_outputs.len());
+        for (i, output) in raw_outputs.iter().enumerate() {
+            if i == 0 {
+                results.push(output.clone());
+            } else {
+                results.push(trimmer.trim(&raw_outputs[i - 1], output));
+            }
+        }
+
         Ok(results.join(" "))
     }
 
@@ -1398,9 +1738,11 @@ mod batching_tests {
 
         let result = translator.translate(&text).unwrap();
 
-        // Chunk 0 (400 words) encodes to [400] and decodes to "t400"; chunk 1
-        // to "t200". Original order must be preserved despite length sorting.
-        assert_eq!(result, "t400 t200");
+        // Chunk 0 (400 words) encodes to [400] and decodes to "t400". Chunk 1
+        // gets a 24-word context overlap prepended: 24 + 200 = 224 words, so it
+        // decodes to "t224". Original order must be preserved despite length
+        // sorting, and the OverlapTrimmer must not touch the mock outputs.
+        assert_eq!(result, "t400 t224");
         assert_eq!(translator.probed_batch_size(), Some(8));
     }
 
@@ -1426,7 +1768,7 @@ mod batching_tests {
         );
 
         let result = translator.translate(&text).unwrap();
-        assert_eq!(result, "t400 t200");
+        assert_eq!(result, "t400 t224");
         assert_eq!(translator.probed_batch_size(), Some(2));
     }
 
@@ -1476,7 +1818,7 @@ mod batching_tests {
         );
 
         let result = translator.translate(&text).unwrap();
-        assert_eq!(result, "t400 t200");
+        assert_eq!(result, "t400 t224");
         assert_eq!(translator.probed_batch_size(), Some(2));
     }
 
@@ -1486,6 +1828,170 @@ mod batching_tests {
             "{}.",
             std::iter::repeat_n(word, n).collect::<Vec<_>>().join(" ")
         )
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Context overlap & OverlapTrimmer tests
+// ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::{
+        apply_context_overlap, OverlapTrimmer, CONTEXT_OVERLAP_MAX_WORDS, CONTEXT_OVERLAP_MIN_WORDS,
+    };
+
+    /// Token proxy: count whitespace-separated words.
+    fn count_words(text: &str) -> Result<usize, std::convert::Infallible> {
+        Ok(text.split_whitespace().count())
+    }
+
+    /// Builds a string of `n` words `prefix0 prefix1 ...`.
+    fn words(n: usize, prefix: &str) -> String {
+        (0..n)
+            .map(|i| format!("{prefix}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn tail_words(text: &str, n: usize) -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        words[words.len().saturating_sub(n)..].join(" ")
+    }
+
+    #[test]
+    fn test_overlap_single_chunk_unchanged() {
+        let chunks = vec![words(100, "a")];
+        let augmented = apply_context_overlap(&chunks, &count_words, 480).unwrap();
+        assert_eq!(augmented, chunks);
+    }
+
+    #[test]
+    fn test_overlap_prepends_previous_tail() {
+        let chunks = vec![words(100, "a"), words(50, "b")];
+        let augmented = apply_context_overlap(&chunks, &count_words, 480).unwrap();
+
+        assert_eq!(augmented.len(), 2);
+        assert_eq!(augmented[0], chunks[0]);
+        assert!(
+            augmented[1].starts_with(&tail_words(&chunks[0], CONTEXT_OVERLAP_MAX_WORDS)),
+            "chunk 1 must be prefixed with the tail of chunk 0"
+        );
+        assert!(augmented[1].ends_with(&chunks[1]));
+        assert!(
+            augmented[1].split_whitespace().count() <= 480,
+            "overlap + body must honour the target budget"
+        );
+    }
+
+    #[test]
+    fn test_overlap_shrinks_window_before_trimming_body() {
+        // Body of 460 words cannot take the full 24-word overlap (484 > 480)
+        // but fits a 20-word overlap exactly, so the overlap shrinks and the
+        // body is preserved whole.
+        let chunks = vec![words(480, "a"), words(460, "b")];
+        let augmented = apply_context_overlap(&chunks, &count_words, 480).unwrap();
+
+        let count = augmented[1].split_whitespace().count();
+        assert_eq!(count, 480);
+        assert!(
+            augmented[1].starts_with(&tail_words(&chunks[0], 20)),
+            "overlap must shrink to 20 words: {}",
+            augmented[1]
+        );
+        assert!(
+            augmented[1].ends_with("b459"),
+            "body must be preserved: {}",
+            augmented[1]
+        );
+    }
+
+    #[test]
+    fn test_overlap_budget_strictly_honored_when_body_at_limit() {
+        // Both chunks sit exactly at the target; even the 16-word minimum
+        // overlap overflows, so the body's front is trimmed to make room.
+        let chunks = vec![words(480, "a"), words(480, "b")];
+        let augmented = apply_context_overlap(&chunks, &count_words, 480).unwrap();
+
+        let count = augmented[1].split_whitespace().count();
+        assert_eq!(
+            count, 480,
+            "overlap + trimmed body must stay at exactly 480 tokens"
+        );
+        assert!(
+            augmented[1].starts_with(&tail_words(&chunks[0], CONTEXT_OVERLAP_MIN_WORDS)),
+            "minimum overlap must be preserved"
+        );
+        assert!(
+            augmented[1].ends_with("b479"),
+            "the body tail must be kept intact"
+        );
+    }
+
+    #[test]
+    fn test_exact_boundary_trim_normalized_case_and_punctuation() {
+        let prev = "The cat sat toward the table";
+        let cur = "Toward the table, the cat purred";
+        let trimmed = OverlapTrimmer::default().trim(prev, cur);
+
+        assert_eq!(trimmed, "the cat purred");
+    }
+
+    #[test]
+    fn test_fuzzy_ngram_trim_toward_vs_towards() {
+        // Exact match fails ("toward" vs "towards"), but the 3-gram
+        // "toward the table" / "towards the table" is a high-confidence,
+        // anchored fuzzy match with two meaningful words.
+        let prev = "The dog walked toward the table";
+        let cur = "Towards the table, it sniffed";
+        let trimmed = OverlapTrimmer::default().trim(prev, cur);
+
+        assert_eq!(trimmed, "it sniffed");
+    }
+
+    #[test]
+    fn test_no_trim_for_single_word_match() {
+        let prev = "She went home";
+        let cur = "Home is where the heart is";
+        assert_eq!(OverlapTrimmer::default().trim(prev, cur), cur);
+    }
+
+    #[test]
+    fn test_no_trim_for_stop_word_only_match() {
+        let prev = "Go to the and the";
+        let cur = "the and the way home";
+        assert_eq!(OverlapTrimmer::default().trim(prev, cur), cur);
+    }
+
+    #[test]
+    fn test_no_trim_for_semantically_divergent_text() {
+        // "walked toward the table" vs "walked toward the door": the n-gram
+        // similarity falls below the threshold, so nothing is trimmed.
+        let prev = "He walked toward the table";
+        let cur = "Walked toward the door, she said";
+        assert_eq!(OverlapTrimmer::default().trim(prev, cur), cur);
+    }
+
+    #[test]
+    fn test_upper_bound_limits_maximum_trimmed_words() {
+        let dup = std::iter::repeat_n("dup", 30).collect::<Vec<_>>().join(" ");
+        let prev = format!("x y {dup}");
+        let cur = format!("{dup} z w");
+
+        let trimmed = OverlapTrimmer::default().trim(&prev, &cur);
+        let trimmed_words: Vec<&str> = trimmed.split_whitespace().collect();
+
+        assert_eq!(trimmed_words.len(), 32 - 20);
+        assert!(
+            trimmed_words
+                .iter()
+                .all(|w| *w == "dup" || *w == "z" || *w == "w"),
+            "unexpected words remain after trimming: {trimmed_words:?}"
+        );
+        assert_eq!(
+            trimmed_words[0], "dup",
+            "duplicated words beyond the upper bound must be left untouched"
+        );
     }
 }
 
