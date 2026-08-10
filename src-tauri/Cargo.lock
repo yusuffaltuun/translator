@@ -4420,6 +4420,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "ort",
+ "thiserror 2.0.19",
  "tokenizers",
 ]
 

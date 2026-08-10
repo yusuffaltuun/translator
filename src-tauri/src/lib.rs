@@ -16,7 +16,7 @@ struct AppState {
 
 #[tauri::command]
 async fn read_selection() -> Result<String, String> {
-    tokio::task::spawn_blocking(|| translator::read_selection())
+    tokio::task::spawn_blocking(translator::read_selection)
         .await
         .map_err(|e| format!("task join error: {}", e))?
 }
@@ -24,9 +24,9 @@ async fn read_selection() -> Result<String, String> {
 #[tauri::command]
 async fn translate(text: String, state: State<'_, TranslatorState>) -> Result<String, String> {
     let translator = state.0.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
         let mut t = translator.lock().map_err(|e| e.to_string())?;
-        t.translate(&text)
+        t.translate(&text).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("task join error: {}", e))?
@@ -52,7 +52,7 @@ async fn selection_translate(
             return Err("No primary selection found. Select some text first.".into());
         }
         let mut t = translator.lock().map_err(|e| e.to_string())?;
-        let tr = t.translate(&text)?;
+        let tr = t.translate(&text).map_err(|e| e.to_string())?;
         Ok((text, tr))
     })
     .await;
