@@ -16,6 +16,13 @@ thiserror = "2.0.19"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [[bench]]
 name = "bench_text_handling"
 harness = false
